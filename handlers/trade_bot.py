@@ -1,9 +1,9 @@
-import json
+import time
 import logging
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.error import TelegramError
-from telegram.ext import Application, CallbackQueryHandler, ContextTypes
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 import config
 from services.trade_executor import execute_trade
 
@@ -11,8 +11,24 @@ logger = logging.getLogger(__name__)
 
 _trade_app: Application = None
 
-# In-memory store: callback_data_id → signal dict
+# In-memory store: unique_id → signal dict
 pending_signals: dict[str, dict] = {}
+
+# Dummy signal for /test command
+TEST_SIGNAL = {
+    "tradeable": True,
+    "coin": "BTC",
+    "direction": "LONG",
+    "confidence": 95,
+    "leverage": 20,
+    "entry": 67000,
+    "tp": 68500,
+    "sl": 66000,
+    "reason": "TEST MODE — system check, koi real trade nahi hoga.",
+    "news_title": "🧪 Test Signal",
+    "news_source": "Manual /test command",
+    "is_test": True,
+}
 
 
 def get_trade_app() -> Application:
@@ -24,36 +40,30 @@ def get_trade_app() -> Application:
             .build()
         )
         _trade_app.add_handler(CallbackQueryHandler(handle_approval_callback))
+        _trade_app.add_handler(CommandHandler("test", handle_test_command))
+        _trade_app.add_handler(CommandHandler("start", handle_start_command))
     return _trade_app
 
 
 def format_signal_message(signal: dict) -> str:
     """Format the trade signal card sent to admin."""
     direction_emoji = "🟢" if signal["direction"] == "LONG" else "🔴"
-    direction = signal["direction"]
-    coin = signal["coin"]
-    confidence = signal["confidence"]
-    leverage = signal["leverage"]
-    entry = signal["entry"]
-    tp = signal["tp"]
-    sl = signal["sl"]
-    reason = signal.get("reason", "N/A")
-    news_title = signal.get("news_title", "N/A")
-    news_source = signal.get("news_source", "N/A")
+    test_badge = "🧪 *TEST SIGNAL*\n" if signal.get("is_test") else ""
 
     return (
-        f"{direction_emoji} *{coin} {direction}*\n"
+        f"{test_badge}"
+        f"{direction_emoji} *{signal['coin']} {signal['direction']}*\n"
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"📊 Confidence: `{confidence}%`\n"
-        f"⚡ Leverage: `{leverage}x`\n"
-        f"🎯 Entry: `{entry}`\n"
-        f"✅ Take Profit: `{tp}`\n"
-        f"❌ Stop Loss: `{sl}`\n"
+        f"📊 Confidence: `{signal['confidence']}%`\n"
+        f"⚡ Leverage: `{signal['leverage']}x`\n"
+        f"🎯 Entry: `{signal['entry']}`\n"
+        f"✅ Take Profit: `{signal['tp']}`\n"
+        f"❌ Stop Loss: `{signal['sl']}`\n"
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"📰 *News:* {news_title}\n"
-        f"📡 *Source:* {news_source}\n"
+        f"📰 *News:* {signal.get('news_title', 'N/A')}\n"
+        f"📡 *Source:* {signal.get('news_source', 'N/A')}\n"
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"💡 *Reason:* _{reason}_\n"
+        f"💡 *Reason:* _{signal.get('reason', 'N/A')}_\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"⚠️ Risk Mode: `{config.RISK_MODE}`"
     )
@@ -64,34 +74,50 @@ async def send_signal_to_admin(signal: dict) -> bool:
     app = get_trade_app()
     bot: Bot = app.bot
 
-    # Store signal for later retrieval on callback
     signal_id = signal.get("news_title", "")[:20].replace(" ", "_")
-    import time
     unique_id = f"{signal_id}_{int(time.time())}"
     pending_signals[unique_id] = signal
 
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("✅ APPROVE", callback_data=f"approve|{unique_id}"),
-            InlineKeyboardButton("❌ REJECT", callback_data=f"reject|{unique_id}"),
-        ]
-    ])
-
-    message = format_signal_message(signal)
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ APPROVE", callback_data=f"approve|{unique_id}"),
+        InlineKeyboardButton("❌ REJECT",  callback_data=f"reject|{unique_id}"),
+    ]])
 
     try:
         await bot.send_message(
             chat_id=config.TELEGRAM_ADMIN_CHAT_ID,
-            text=message,
+            text=format_signal_message(signal),
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=keyboard,
         )
         logger.info(f"Signal sent to admin: {signal['coin']} {signal['direction']}")
         return True
-
     except TelegramError as e:
         logger.error(f"Failed to send signal to admin: {e}")
         return False
+
+
+async def handle_start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/start — bot intro message."""
+    if update.effective_user.id != config.TELEGRAM_ADMIN_CHAT_ID:
+        return
+    await update.message.reply_text(
+        "🤖 *Crypto Trade Bot active!*\n\n"
+        "Commands:\n"
+        "📌 `/test` — test signal bhejo (koi real trade nahi)\n\n"
+        "Jab AI koi accha trade dhundega, yahan approve/reject milega.",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+async def handle_test_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/test — dummy signal bhejo to check bot is working."""
+    if update.effective_user.id != config.TELEGRAM_ADMIN_CHAT_ID:
+        await update.message.reply_text("⛔ Unauthorized")
+        return
+
+    await update.message.reply_text("🧪 Test signal bhej raha hoon...")
+    await send_signal_to_admin(TEST_SIGNAL.copy())
 
 
 async def handle_approval_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -99,13 +125,12 @@ async def handle_approval_callback(update: Update, context: ContextTypes.DEFAULT
     query = update.callback_query
     await query.answer()
 
-    # Security: only admin can interact
+    # Security: sirf admin interact kar sakta hai
     if query.from_user.id != config.TELEGRAM_ADMIN_CHAT_ID:
         await query.answer("⛔ Unauthorized", show_alert=True)
         return
 
-    data = query.data  # "approve|unique_id" or "reject|unique_id"
-    action, unique_id = data.split("|", 1)
+    action, unique_id = query.data.split("|", 1)
     signal = pending_signals.get(unique_id)
 
     if not signal:
@@ -113,45 +138,56 @@ async def handle_approval_callback(update: Update, context: ContextTypes.DEFAULT
         return
 
     if action == "approve":
-        await query.edit_message_text(
-            text=f"⏳ Executing trade: {signal['coin']} {signal['direction']}...",
-            parse_mode=ParseMode.MARKDOWN,
-        )
-        result = await execute_trade(signal)
-
-        if result["success"]:
+        # Test signal ke liye real trade mat karo
+        if signal.get("is_test"):
             await query.edit_message_text(
                 text=(
-                    f"✅ *Trade Executed!*\n\n"
-                    f"*{signal['coin']} {signal['direction']}* @ `{signal['entry']}`\n"
-                    f"Leverage: `{signal['leverage']}x` | Confidence: `{signal['confidence']}%`\n\n"
-                    f"TP: `{signal['tp']}` | SL: `{signal['sl']}`\n\n"
-                    f"_{result['message']}_"
+                    "✅ *Test Approved!*\n\n"
+                    "Bot sahi kaam kar raha hai 🎉\n"
+                    "_(Test mode — koi real trade nahi hua)_"
                 ),
                 parse_mode=ParseMode.MARKDOWN,
             )
         else:
             await query.edit_message_text(
-                text=f"❌ *Trade Failed!*\n\n`{result['message']}`",
+                text=f"⏳ Executing: *{signal['coin']} {signal['direction']}*...",
                 parse_mode=ParseMode.MARKDOWN,
             )
+            result = await execute_trade(signal)
+
+            if result["success"]:
+                await query.edit_message_text(
+                    text=(
+                        f"✅ *Trade Executed!*\n\n"
+                        f"*{signal['coin']} {signal['direction']}* @ `{signal['entry']}`\n"
+                        f"Leverage: `{signal['leverage']}x` | Confidence: `{signal['confidence']}%`\n\n"
+                        f"TP: `{signal['tp']}` | SL: `{signal['sl']}`\n\n"
+                        f"_{result['message']}_"
+                    ),
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+            else:
+                await query.edit_message_text(
+                    text=f"❌ *Trade Failed!*\n\n`{result['message']}`",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
 
     elif action == "reject":
+        label = "Test Rejected" if signal.get("is_test") else "Trade Rejected"
         await query.edit_message_text(
             text=(
-                f"🚫 *Trade Rejected*\n\n"
+                f"🚫 *{label}*\n\n"
                 f"{signal['coin']} {signal['direction']} signal dropped.\n"
                 f"Confidence was: `{signal['confidence']}%`"
             ),
             parse_mode=ParseMode.MARKDOWN,
         )
 
-    # Remove from pending after action
     pending_signals.pop(unique_id, None)
 
 
 async def send_error_to_admin(error_msg: str):
-    """Send a system error message to admin."""
+    """Send a system error alert to admin."""
     app = get_trade_app()
     bot: Bot = app.bot
     try:
