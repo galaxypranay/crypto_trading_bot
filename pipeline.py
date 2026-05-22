@@ -1,6 +1,5 @@
 import logging
 import asyncio
-from datetime import datetime, timezone
 
 from services.news_fetcher import fetch_news_from_rss
 from services.ai_analyzer import analyze_news, pick_best_signal
@@ -16,13 +15,12 @@ seen_news_ids: set[str] = set()
 
 async def run_pipeline():
     """
-    Full pipeline:
-    1. Fetch latest news from RSS feeds
+    Updated pipeline — AI filter pehle, channel post baad mein:
+    1. Fetch news from RSS feeds
     2. Filter only new (unseen) articles
-    3. Post each new article to Telegram news channel
-    4. Analyze each article with AI for trade signal
-    5. Pick best signal (highest confidence above threshold)
-    6. Send best signal to admin trade bot for approval
+    3. AI analyze karo — sirf tradeable news aage jaaye
+    4. Tradeable news → channel mein post karo
+    5. Best signal (highest confidence) → admin trade bot ko bhejo
     """
     logger.info("Pipeline triggered — fetching news...")
 
@@ -32,47 +30,52 @@ async def run_pipeline():
         error = f"News fetch failed: {e}"
         logger.error(error)
         await send_error_to_admin(error)
-        await send_error_to_channel(error)
         return
 
-    # Filter only new articles
+    # Sirf naye articles
     new_articles = [n for n in all_news if n["id"] not in seen_news_ids]
 
     if not new_articles:
         logger.info("No new articles found.")
         return
 
-    logger.info(f"Found {len(new_articles)} new articles.")
+    logger.info(f"Found {len(new_articles)} new articles — sending to AI filter...")
 
     signals = []
 
     for article in new_articles:
-        # Mark as seen immediately to prevent reprocessing
+        # Pehle seen mark karo — reprocessing rokne ke liye
         seen_news_ids.add(article["id"])
 
-        # Step 1: Post to news channel (every article)
-        await post_news_to_channel(article)
+        logger.info(f"AI analyzing: {article['title'][:60]}")
 
-        # Small delay to avoid Telegram rate limits
-        await asyncio.sleep(1.5)
-
-        # Step 2: Analyze with AI
-        logger.info(f"Analyzing: {article['title'][:60]}")
         try:
             signal = await analyze_news(article)
-            if signal:
-                signals.append(signal)
-                if signal.get("tradeable"):
-                    logger.info(
-                        f"Signal: {signal.get('coin')} {signal.get('direction')} "
-                        f"@ {signal.get('confidence')}% confidence"
-                    )
-                else:
-                    logger.info(f"Not tradeable: {signal.get('reason', 'unknown')}")
         except Exception as e:
-            logger.error(f"AI analysis error for article '{article['title'][:40]}': {e}")
+            logger.error(f"AI error for '{article['title'][:40]}': {e}")
+            continue
 
-    # Step 3: Pick best signal above threshold
+        if not signal:
+            logger.info("AI returned no signal — skipping.")
+            continue
+
+        if not signal.get("tradeable"):
+            # News kaam ka nahi — channel mein nahi jayega
+            logger.info(f"Not tradeable → ignored: {signal.get('reason', 'no reason')}")
+            continue
+
+        # ✅ AI ne approve kiya — channel mein post karo
+        logger.info(
+            f"Tradeable! {signal.get('coin')} {signal.get('direction')} "
+            f"@ {signal.get('confidence')}% — posting to channel..."
+        )
+        await post_news_to_channel(article)
+        signals.append(signal)
+
+        # Telegram rate limit se bachne ke liye
+        await asyncio.sleep(1.5)
+
+    # Best signal admin ko bhejo
     best = pick_best_signal(signals)
 
     if best:
@@ -83,10 +86,10 @@ async def run_pipeline():
         await send_signal_to_admin(best)
     else:
         logger.info(
-            f"No signal met the minimum confidence threshold ({config.MIN_CONFIDENCE}%)."
+            f"No signal met the confidence threshold ({config.MIN_CONFIDENCE}%)."
         )
 
-    # Clean old seen IDs to prevent memory leak (keep last 500)
+    # Memory leak se bachao — purane IDs hata do
     if len(seen_news_ids) > 1000:
         keep = list(seen_news_ids)[-500:]
         seen_news_ids.clear()
