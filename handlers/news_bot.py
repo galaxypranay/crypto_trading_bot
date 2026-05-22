@@ -16,40 +16,28 @@ def get_news_bot() -> Bot:
     return _news_bot
 
 
-def format_news_message(news_item: dict) -> str:
-    """Format a news item for the Telegram channel."""
-    coin = news_item.get("coin")
-    coin_tag = f"#{coin} " if coin else ""
+def format_news_message(news_item: dict, ai_description: str) -> str:
+    """
+    Format news for Telegram channel.
+    AI-generated description use hoti hai — generic nahi.
+    """
+    coin    = news_item["coin"]
+    title   = news_item["title"]
+    url     = news_item["url"]
+    source  = news_item.get("source", "Unknown")
 
-    title = news_item["title"]
-    source = news_item.get("source", "Unknown")
-    url = news_item["url"]
-    summary = news_item.get("summary", "")
-
-    lines = [
-        f"📰 *{title}*",
-        "",
-    ]
-
-    if summary:
-        # Trim summary to 200 chars
-        short = summary[:200] + ("..." if len(summary) > 200 else "")
-        lines.append(f"_{short}_")
-        lines.append("")
-
-    lines.append(f"🔗 [Read full article]({url})")
-    lines.append(f"📡 Source: {source}")
-
-    if coin_tag:
-        lines.append(f"\n{coin_tag}#crypto #news")
-
-    return "\n".join(lines)
+    return (
+        f"#{coin} 📰 *{title}*\n\n"
+        f"{ai_description}\n\n"
+        f"🔗 [Read more]({url})\n"
+        f"📡 _{source}_"
+    )
 
 
-async def post_news_to_channel(news_item: dict) -> bool:
-    """Post a single news item to the Telegram news channel."""
+async def post_news_to_channel(news_item: dict, ai_description: str) -> bool:
+    """Post a single coin-related news item to the Telegram channel."""
     bot = get_news_bot()
-    message = format_news_message(news_item)
+    message = format_news_message(news_item, ai_description)
 
     try:
         await bot.send_message(
@@ -58,16 +46,15 @@ async def post_news_to_channel(news_item: dict) -> bool:
             parse_mode=ParseMode.MARKDOWN,
             disable_web_page_preview=False,
         )
-        logger.info(f"Posted to channel: {news_item['title'][:60]}")
+        logger.info(f"Channel post: [{news_item['coin']}] {news_item['title'][:50]}")
         return True
-
     except TelegramError as e:
-        logger.error(f"Failed to post news to channel: {e}")
+        logger.error(f"Channel post failed: {e}")
         return False
 
 
 async def send_error_to_channel(error_msg: str):
-    """Post a system error alert to the channel."""
+    """Post system error to channel."""
     bot = get_news_bot()
     try:
         await bot.send_message(
@@ -76,4 +63,4 @@ async def send_error_to_channel(error_msg: str):
             parse_mode=ParseMode.MARKDOWN,
         )
     except TelegramError as e:
-        logger.error(f"Failed to send error to channel: {e}")
+        logger.error(f"Channel error post failed: {e}")
