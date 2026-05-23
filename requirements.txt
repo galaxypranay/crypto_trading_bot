@@ -6,3 +6,4 @@ python-dotenv==1.0.1
 apscheduler==3.10.4
 feedparser==6.0.11
 bulk-keychain==0.1.17
+asyncpg==0.29.0
