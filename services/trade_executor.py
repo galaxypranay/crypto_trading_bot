@@ -31,15 +31,47 @@ def _coin_to_symbol(coin: str) -> str:
     return f"{coin.upper()}-USD"
 
 
-def _calculate_size(coin: str, entry: float, usdt_amount: float) -> float:
-    """USDT amount se coin size calculate karo with min size enforcement."""
+def _calculate_size(coin: str, entry: float, usdt_amount: float, leverage: int) -> float:
+    """
+    USDT amount se coin size calculate karo.
+
+    Effective leverage check:
+      notional_value = size * entry_price
+      effective_leverage = notional_value / usdt_amount
+
+    Ye effective_leverage coin max leverage se zyada nahi honi chahiye.
+    Agar ho toh size reduce karo.
+    """
     min_size = SUPPORTED_COINS.get(coin.upper(), {}).get("min_size", 0.01)
+    coin_max_lev = SUPPORTED_COINS.get(coin.upper(), {}).get("max_leverage", 50)
+
     if entry <= 0:
         return min_size
+
+    # Basic size from USDT amount
     size = round(usdt_amount / entry, 6)
+
+    # Effective leverage check karo
+    # notional = size * entry
+    # margin_required = notional / leverage
+    # effective_lev = notional / usdt_amount
+    notional = size * entry
+    effective_lev = notional / usdt_amount if usdt_amount > 0 else leverage
+
+    # Agar effective leverage coin max se zyada ho toh size ghata do
+    if effective_lev > coin_max_lev:
+        max_notional = usdt_amount * coin_max_lev * 0.9  # 10% safety buffer
+        size = round(max_notional / entry, 6)
+        logger.warning(
+            f"Size reduced: effective_lev={effective_lev:.1f}x > coin_max={coin_max_lev}x | "
+            f"new size={size} ({coin})"
+        )
+
     if size < min_size:
         logger.warning(f"Size {size} too small for {coin}, using min {min_size}")
         size = min_size
+
+    logger.info(f"Size calc [{coin}]: ${usdt_amount} USDT / {entry} = {size} coins | notional=${size*entry:.2f}")
     return size
 
 
@@ -120,7 +152,7 @@ async def execute_trade(signal: dict) -> dict:
         return {"success": False, "message": msg}
 
     leverage = _clamp_leverage(coin, leverage)
-    size     = _calculate_size(coin, entry, usdt_amount)
+    size     = _calculate_size(coin, entry, usdt_amount, leverage)
 
     logger.info(
         f"Trade: {symbol} {direction} x{leverage} | "
