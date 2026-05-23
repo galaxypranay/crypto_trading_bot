@@ -8,6 +8,7 @@ Tables:
   pending_signals — server restart ke baad bhi signals survive karein
 """
 import os
+from typing import Optional
 import json
 import logging
 from datetime import datetime, timezone, timedelta
@@ -258,7 +259,3 @@ async def close_db():
     if _pool:
         await _pool.close()
         logger.info("DB pool closed.")
-
-
-# Optional type hint fix
-from typing import Optional
