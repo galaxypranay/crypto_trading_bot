@@ -9,6 +9,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import config
 from config import validate_config
 from pipeline import run_pipeline
+from services.database import init_db, close_db
 from handlers.trade_bot import get_trade_app
 from handlers.news_bot import get_news_app
 
@@ -32,6 +33,9 @@ async def lifespan(app: FastAPI):
         logger.critical(f"Config error: {e}")
         sys.exit(1)
 
+    # ── Postgres init ─────────────────────────────────────────
+    await init_db()
+
     # ── Trade Bot polling (Approve/Reject + /test) ────────────
     trade_app = get_trade_app()
     await trade_app.initialize()
@@ -46,7 +50,7 @@ async def lifespan(app: FastAPI):
     await news_app.updater.start_polling(drop_pending_updates=True)
     logger.info("News bot polling started.")
 
-    # ── Pipeline scheduler — har naye news pe auto-run ────────
+    # ── Pipeline scheduler ────────────────────────────────────
     scheduler.add_job(
         run_pipeline,
         trigger="interval",
@@ -58,7 +62,6 @@ async def lifespan(app: FastAPI):
     scheduler.start()
     logger.info("Scheduler started — pipeline runs every 2 minutes.")
 
-    # Startup pe ek baar turant run karo
     asyncio.create_task(run_pipeline())
 
     yield
@@ -72,14 +75,11 @@ async def lifespan(app: FastAPI):
     await news_app.updater.stop()
     await news_app.stop()
     await news_app.shutdown()
-    logger.info("Bot stopped cleanly.")
+    await close_db()
+    logger.info("Stopped cleanly.")
 
 
-app = FastAPI(
-    title="Crypto AI Trading Bot",
-    version="1.0.0",
-    lifespan=lifespan,
-)
+app = FastAPI(title="Crypto AI Trading Bot", version="1.0.0", lifespan=lifespan)
 
 
 @app.get("/")
@@ -91,24 +91,16 @@ async def root():
         "ai_model": config.FREEMODEL_MODEL,
     }
 
-
 @app.get("/health")
 async def health():
     return {"status": "ok"}
-
 
 @app.post("/trigger")
 async def trigger_pipeline():
     asyncio.create_task(run_pipeline())
     return {"status": "pipeline triggered"}
 
-
 @app.get("/status")
 async def status():
     jobs = [{"id": j.id, "next_run": str(j.next_run_time)} for j in scheduler.get_jobs()]
-    return {
-        "scheduler_running": scheduler.running,
-        "jobs": jobs,
-        "risk_mode": config.RISK_MODE,
-        "min_confidence": config.MIN_CONFIDENCE,
-    }
+    return {"scheduler_running": scheduler.running, "jobs": jobs}
