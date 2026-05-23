@@ -1,4 +1,5 @@
 import httpx
+import feedparser
 import hashlib
 from datetime import datetime, timezone
 from typing import Optional
@@ -6,7 +7,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-# Tradeable coin tickers — sirf inse related news fetch hogi
+# Tradeable coins only
 TRADEABLE_COINS = {
     "bitcoin": "BTC", "btc": "BTC",
     "ethereum": "ETH", "eth": "ETH",
@@ -30,17 +31,20 @@ TRADEABLE_COINS = {
     "injective": "INJ", "inj": "INJ",
 }
 
-# CoinGecko free news API
-COINGECKO_NEWS_URL = "https://api.coingecko.com/api/v3/news"
+# Free RSS feeds — no API key needed
+RSS_FEEDS = [
+    "https://cointelegraph.com/rss",
+    "https://decrypt.co/feed",
+    "https://cryptonews.com/news/feed/",
+    "https://bitcoinist.com/feed/",
+]
 
 
 def make_news_id(title: str, url: str) -> str:
-    """Unique ID for deduplication."""
     return hashlib.md5(f"{title}{url}".encode()).hexdigest()
 
 
 def extract_coin(title: str, description: str = "") -> Optional[str]:
-    """Extract the main tradeable coin ticker from news text."""
     text = (title + " " + description).lower()
     for name, ticker in TRADEABLE_COINS.items():
         if name in text:
@@ -50,61 +54,55 @@ def extract_coin(title: str, description: str = "") -> Optional[str]:
 
 async def fetch_coingecko_news() -> list[dict]:
     """
-    Fetch latest news from CoinGecko free API.
-    Sirf wo news jo kisi tradeable coin se related ho.
+    Fetch crypto news from free RSS feeds.
+    Sirf tradeable coin se related news return hoti hai.
     """
     all_news = []
 
-    try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            response = await client.get(
-                COINGECKO_NEWS_URL,
-                params={"per_page": 20},
-                headers={"accept": "application/json"},
-            )
-            response.raise_for_status()
-            data = response.json()
-
-        # CoinGecko returns a list directly or under a key
-        articles = data if isinstance(data, list) else data.get("data", [])
-
-        for item in articles:
-            title       = item.get("title", "").strip()
-            url         = item.get("url", "").strip()
-            description = item.get("description", item.get("author", "")).strip()
-            source      = item.get("news_site", item.get("source", "CoinGecko"))
-            published   = item.get("published_at", item.get("created_at", ""))
-            thumb       = item.get("thumb_2x", item.get("image_url", ""))
-
-            if not title or not url:
-                continue
-
-            # Sirf tradeable coin se related news
-            coin = extract_coin(title, description)
-            if not coin:
-                continue
-
-            # Parse timestamp
+    async with httpx.AsyncClient(timeout=15) as client:
+        for feed_url in RSS_FEEDS:
             try:
-                pub_dt = datetime.fromisoformat(published.replace("Z", "+00:00"))
-            except Exception:
-                pub_dt = datetime.now(timezone.utc)
+                response = await client.get(feed_url)
+                feed = feedparser.parse(response.text)
+                source = feed.feed.get("title", "Crypto News")
 
-            all_news.append({
-                "id":           make_news_id(title, url),
-                "title":        title,
-                "url":          url,
-                "description":  description[:400] if description else "",
-                "source":       source,
-                "published_at": pub_dt,
-                "coin":         coin,
-                "thumb":        thumb,
-            })
+                for entry in feed.entries[:15]:
+                    title       = entry.get("title", "").strip()
+                    url         = entry.get("link", "").strip()
+                    description = entry.get("summary", "").strip()[:400]
 
-    except Exception as e:
-        logger.error(f"CoinGecko news fetch error: {e}")
+                    if not title or not url:
+                        continue
 
-    # Newest first
-    all_news.sort(key=lambda x: x["published_at"], reverse=True)
-    logger.info(f"CoinGecko: fetched {len(all_news)} coin-related articles")
-    return all_news
+                    coin = extract_coin(title, description)
+                    if not coin:
+                        continue
+
+                    try:
+                        pub_dt = datetime(*entry.published_parsed[:6], tzinfo=timezone.utc)
+                    except Exception:
+                        pub_dt = datetime.now(timezone.utc)
+
+                    all_news.append({
+                        "id":           make_news_id(title, url),
+                        "title":        title,
+                        "url":          url,
+                        "description":  description,
+                        "source":       source,
+                        "published_at": pub_dt,
+                        "coin":         coin,
+                    })
+
+            except Exception as e:
+                logger.error(f"RSS fetch error [{feed_url}]: {e}")
+
+    # Newest first, deduplicate by id
+    seen = set()
+    unique = []
+    for n in sorted(all_news, key=lambda x: x["published_at"], reverse=True):
+        if n["id"] not in seen:
+            seen.add(n["id"])
+            unique.append(n)
+
+    logger.info(f"Fetched {len(unique)} unique coin-related articles from RSS")
+    return unique
