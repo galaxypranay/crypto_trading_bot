@@ -51,10 +51,13 @@ MIN_CONFIDENCE = int(os.getenv("MIN_CONFIDENCE", "65"))
 # MID   → 50x-70x suggest  (exchange max se clamp hoga — effectively 40-50x)
 # LOW   → 20x-40x suggest  (sahi range, exchange max se match karta hai)
 
+# Leverage suggestion range for AI
+# Exchange ke coin-specific max se clamp hogi (BTC=50x, BNB=40x, DOGE=10x etc.)
+# HIGH mode mein bhi AI ko 10-50x suggest karna chahiye
 LEVERAGE_MAP = {
-    "LOW":  {"min": 20, "max": 40},
-    "MID":  {"min": 50, "max": 70},
-    "HIGH": {"min": 80, "max": 100},
+    "LOW":  {"min": 3,  "max": 10},
+    "MID":  {"min": 5,  "max": 25},
+    "HIGH": {"min": 10, "max": 50},
 }
 
 
