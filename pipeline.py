@@ -10,6 +10,9 @@ import config
 
 logger = logging.getLogger(__name__)
 
+# Global lock — ek waqt mein sirf ek pipeline run karega
+_pipeline_lock = asyncio.Lock()
+
 
 async def run_pipeline():
     """
@@ -22,6 +25,16 @@ async def run_pipeline():
     5. FreeModel se trade signal analyze karo
     6. Best signal (highest confidence) → admin ko bhejo
     """
+    # Agar pehle se chal raha hai toh skip karo (duplicate post se bachao)
+    if _pipeline_lock.locked():
+        logger.info("Pipeline already running — skipping this trigger.")
+        return
+
+    async with _pipeline_lock:
+        await _run_pipeline_inner()
+
+
+async def _run_pipeline_inner():
     logger.info("Pipeline triggered — fetching news...")
 
     try:
@@ -39,17 +52,17 @@ async def run_pipeline():
     # ── Filter: sirf naye aur fresh articles ─────────────────
     new_articles = []
     for article in all_news:
-        # Purani news skip (6 ghante se zyada)
+        # Purani news skip (6 ghante se zyada) — mark bhi karo future ke liye
         if is_too_old(article["published_at"]):
-            # Silent skip — log spam se bachne ke liye sirf already-seen nahi hain unhe mark karo
-            if not await is_seen(article["id"]):
-                await mark_seen(article["id"])
+            await mark_seen(article["id"])
             continue
 
         # Duplicate check
         if await is_seen(article["id"]):
             continue
 
+        # Turant mark karo — is loop ke andar hi, dusra concurrent run na utha le
+        await mark_seen(article["id"])
         new_articles.append(article)
 
     if not new_articles:
@@ -61,9 +74,6 @@ async def run_pipeline():
     signals = []
 
     for article in new_articles:
-        # Turant mark karo — concurrent runs mein duplicate processing se bacho
-        await mark_seen(article["id"])
-
         coin   = article["coin"]
         title  = article["title"][:60]
         source = article.get("from_source", "unknown")
@@ -87,7 +97,7 @@ async def run_pipeline():
         except Exception as e:
             logger.error(f"Channel post exception [{coin}]: {e}")
 
-        # Telegram rate limit se bachne ke liye wait
+        # Telegram rate limit
         await asyncio.sleep(2)
 
         # ── Step 3: FreeModel se trade signal analyze karo ────
@@ -110,7 +120,6 @@ async def run_pipeline():
         else:
             logger.info(f"Not tradeable [{coin}]: {signal.get('reason', '—')}")
 
-        # API rate limit
         await asyncio.sleep(1)
 
     # ── Step 4: Best signal admin ko bhejo ───────────────────
@@ -124,7 +133,7 @@ async def run_pipeline():
             await send_signal_to_admin(best)
         else:
             logger.info(
-                f"No valid signal above {config.MIN_CONFIDENCE}% confidence threshold. "
+                f"No valid signal above {config.MIN_CONFIDENCE}% threshold. "
                 f"({len(signals)} signal(s) analyzed)"
             )
     else:
