@@ -31,13 +31,13 @@ def _coin_to_symbol(coin: str) -> str:
     return f"{coin.upper()}-USD"
 
 
-def _calculate_size(coin: str, entry: float, usdt_amount: float, leverage: int) -> float:
+def _calculate_size(coin: str, entry: float, usd_amount: float, leverage: int) -> float:
     """
-    USDT amount se coin size calculate karo.
+    USD amount se coin size calculate karo.
 
     Effective leverage check:
       notional_value = size * entry_price
-      effective_leverage = notional_value / usdt_amount
+      effective_leverage = notional_value / usd_amount
 
     Ye effective_leverage coin max leverage se zyada nahi honi chahiye.
     Agar ho toh size reduce karo.
@@ -48,19 +48,19 @@ def _calculate_size(coin: str, entry: float, usdt_amount: float, leverage: int) 
     if entry <= 0:
         return min_size
 
-    # Basic size from USDT amount
-    size = round(usdt_amount / entry, 6)
+    # Basic size from USD amount
+    size = round(usd_amount / entry, 6)
 
     # Effective leverage check karo
     # notional = size * entry
     # margin_required = notional / leverage
-    # effective_lev = notional / usdt_amount
+    # effective_lev = notional / usd_amount
     notional = size * entry
-    effective_lev = notional / usdt_amount if usdt_amount > 0 else leverage
+    effective_lev = notional / usd_amount if usd_amount > 0 else leverage
 
     # Agar effective leverage coin max se zyada ho toh size ghata do
     if effective_lev > coin_max_lev:
-        max_notional = usdt_amount * coin_max_lev * 0.9  # 10% safety buffer
+        max_notional = usd_amount * coin_max_lev * 0.9  # 10% safety buffer
         size = round(max_notional / entry, 6)
         logger.warning(
             f"Size reduced: effective_lev={effective_lev:.1f}x > coin_max={coin_max_lev}x | "
@@ -71,7 +71,7 @@ def _calculate_size(coin: str, entry: float, usdt_amount: float, leverage: int) 
         logger.warning(f"Size {size} too small for {coin}, using min {min_size}")
         size = min_size
 
-    logger.info(f"Size calc [{coin}]: ${usdt_amount} USDT / {entry} = {size} coins | notional=${size*entry:.2f}")
+    logger.info(f"Size calc [{coin}]: $usd_amount USD / {entry} = {size} coins | notional=${size*entry:.2f}")
     return size
 
 
@@ -118,8 +118,8 @@ async def execute_trade(signal: dict) -> dict:
     Execute bracket trade on early.bulk.trade.
 
     Trade size:
-      - signal['trade_size_usdt'] — admin ne approve ke waqt choose kiya
-      - fallback: config.TRADE_SIZE_USDT (Railway variable)
+      - signal['trade_size_usd'] — admin ne approve ke waqt choose kiya
+      - fallback: config.TRADE_SIZE_USD (Railway variable)
 
     Steps:
       1. Coin supported check
@@ -140,7 +140,7 @@ async def execute_trade(signal: dict) -> dict:
     is_buy    = direction == "LONG"
 
     # Admin ka chosen amount, fallback to config
-    usdt_amount = float(signal.get("trade_size_usdt") or config.TRADE_SIZE_USDT)
+    usd_amount = float(signal.get("trade_size_usd") or config.TRADE_SIZE_USD)
 
     # ── Coin supported check ──────────────────────────────────
     if coin not in SUPPORTED_COINS:
@@ -152,12 +152,12 @@ async def execute_trade(signal: dict) -> dict:
         return {"success": False, "message": msg}
 
     leverage = _clamp_leverage(coin, leverage)
-    size     = _calculate_size(coin, entry, usdt_amount, leverage)
+    size     = _calculate_size(coin, entry, usd_amount, leverage)
 
     logger.info(
         f"Trade: {symbol} {direction} x{leverage} | "
         f"size={size} | entry={entry} | tp={tp_price} | sl={sl_price} | "
-        f"usdt={usdt_amount}"
+        f"usd=${usd_amount}"
     )
 
     try:
@@ -260,7 +260,7 @@ async def execute_trade(signal: dict) -> dict:
                 lines.append(f"ℹ️ {label}: {status_key}")
 
         logger.info(
-            f"Trade done: {symbol} {direction} x{leverage} ${usdt_amount} | "
+            f"Trade done: {symbol} {direction} x{leverage} ${usd_amount} | "
             f"success={overall_success}"
         )
         return {"success": overall_success, "message": "\n".join(lines)}
