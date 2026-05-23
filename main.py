@@ -9,7 +9,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import config
 from config import validate_config
 from pipeline import run_pipeline
-from services.database import init_db, close_db
+from services.database import init_db, close_db, cleanup_old_seen_news
 from handlers.trade_bot import get_trade_app
 from handlers.news_bot import get_news_app
 
@@ -50,7 +50,7 @@ async def lifespan(app: FastAPI):
     await news_app.updater.start_polling(drop_pending_updates=True)
     logger.info("News bot polling started.")
 
-    # ── Pipeline scheduler ────────────────────────────────────
+    # ── Pipeline: har 2 minute ────────────────────────────────
     scheduler.add_job(
         run_pipeline,
         trigger="interval",
@@ -59,9 +59,20 @@ async def lifespan(app: FastAPI):
         max_instances=1,
         misfire_grace_time=30,
     )
-    scheduler.start()
-    logger.info("Scheduler started — pipeline runs every 2 minutes.")
 
+    # ── DB cleanup: roz raat 2 baje ──────────────────────────
+    scheduler.add_job(
+        cleanup_old_seen_news,
+        trigger="cron",
+        hour=2,
+        minute=0,
+        id="db_cleanup",
+    )
+
+    scheduler.start()
+    logger.info("Scheduler started.")
+
+    # Startup pe ek baar turant run karo
     asyncio.create_task(run_pipeline())
 
     yield
@@ -91,14 +102,17 @@ async def root():
         "ai_model": config.FREEMODEL_MODEL,
     }
 
+
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
 
 @app.post("/trigger")
 async def trigger_pipeline():
     asyncio.create_task(run_pipeline())
     return {"status": "pipeline triggered"}
+
 
 @app.get("/status")
 async def status():
