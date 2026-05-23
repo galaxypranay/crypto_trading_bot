@@ -26,7 +26,7 @@ COINGECKO_API_KEY = os.getenv("COINGECKO_API_KEY", "")   # optional, free tier b
 BULK_API_URL        = os.getenv("BULK_API_URL", "https://api.bulk.trade/api/v1")
 BULK_WALLET_ADDRESS = os.getenv("BULK_WALLET_ADDRESS")
 BULK_PRIVATE_KEY    = os.getenv("BULK_PRIVATE_KEY")
-TRADE_SIZE_USDT     = float(os.getenv("TRADE_SIZE_USDT", "50"))
+TRADE_SIZE_USDT     = float(os.getenv("TRADE_SIZE_USDT", "2500"))
 
 # ── Settings ──────────────────────────────────────────────────
 RISK_MODE       = os.getenv("RISK_MODE", "HIGH")
