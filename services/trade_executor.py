@@ -5,16 +5,17 @@ import config
 
 logger = logging.getLogger(__name__)
 
-# Bulk.trade minimum order sizes per coin (lot size)
-MIN_SIZE_MAP = {
-    "BTC":  0.001,
-    "ETH":  0.01,
-    "SOL":  0.1,
-    "BNB":  0.01,
-    "XRP":  10.0,
-    "ADA":  10.0,
-    "DOGE": 100.0,
-    "default": 0.01,
+# ── early.bulk.trade pe available coins aur unka max leverage ─
+SUPPORTED_COINS = {
+    "BTC":      {"max_leverage": 50, "min_size": 0.001},
+    "ETH":      {"max_leverage": 50, "min_size": 0.01},
+    "SOL":      {"max_leverage": 50, "min_size": 0.1},
+    "XRP":      {"max_leverage": 50, "min_size": 10.0},
+    "SUI":      {"max_leverage": 40, "min_size": 10.0},
+    "BNB":      {"max_leverage": 40, "min_size": 0.01},
+    "ZEC":      {"max_leverage": 40, "min_size": 0.01},
+    "DOGE":     {"max_leverage": 10, "min_size": 100.0},
+    "FARTCOIN": {"max_leverage": 25, "min_size": 10.0},
 }
 
 
@@ -31,7 +32,8 @@ def _coin_to_symbol(coin: str) -> str:
 
 def _calculate_size(coin: str, entry: float, usdt_amount: float) -> float:
     """USDT amount se coin size calculate karo with minimum size enforcement."""
-    min_size = MIN_SIZE_MAP.get(coin.upper(), MIN_SIZE_MAP["default"])
+    coin_info = SUPPORTED_COINS.get(coin.upper(), {})
+    min_size  = coin_info.get("min_size", 0.01)
     if entry <= 0:
         return min_size
     size = round(usdt_amount / entry, 6)
@@ -41,13 +43,20 @@ def _calculate_size(coin: str, entry: float, usdt_amount: float) -> float:
     return size
 
 
-async def _set_leverage(signer: Signer, symbol: str, leverage: int) -> bool:
-    """Leverage set karo — max 50x (Bulk.trade hard limit)."""
-    clamped = min(leverage, 50)
+def _clamp_leverage(coin: str, leverage: int) -> int:
+    """Coin ke max leverage se clamp karo."""
+    coin_info   = SUPPORTED_COINS.get(coin.upper(), {})
+    max_allowed = coin_info.get("max_leverage", 50)
+    clamped     = min(leverage, max_allowed)
     if clamped != leverage:
-        logger.warning(f"Leverage clamped {leverage}x → {clamped}x")
+        logger.warning(f"Leverage clamped {leverage}x → {clamped}x (max for {coin}: {max_allowed}x)")
+    return clamped
+
+
+async def _set_leverage(signer: Signer, symbol: str, leverage: int) -> bool:
+    """Leverage set karo."""
     try:
-        tx = signer.sign_user_settings([(symbol, float(clamped))])
+        tx = signer.sign_user_settings([(symbol, float(leverage))])
         async with httpx.AsyncClient(timeout=20) as client:
             resp = await client.post(
                 f"{config.BULK_API_URL}/order",
@@ -56,7 +65,7 @@ async def _set_leverage(signer: Signer, symbol: str, leverage: int) -> bool:
             )
         data = resp.json()
         if resp.status_code in (200, 201) and data.get("status") == "ok":
-            logger.info(f"Leverage set: {symbol} → {clamped}x")
+            logger.info(f"Leverage set: {symbol} → {leverage}x")
             return True
         else:
             logger.warning(f"Leverage set failed: {resp.status_code} | {data}")
@@ -68,27 +77,20 @@ async def _set_leverage(signer: Signer, symbol: str, leverage: int) -> bool:
 
 async def execute_trade(signal: dict) -> dict:
     """
-    Execute bracket trade on Bulk.trade.
+    Execute bracket trade on early.bulk.trade.
 
-    Step 1: Leverage set karo (sign_user_settings)
-    Step 2: Entry + SL + TP atomic transaction (sign_group)
+    Step 1: Coin supported hai check karo
+    Step 2: Leverage set karo (sign_user_settings)
+    Step 3: Entry + SL + TP atomic transaction (sign_group)
 
-    ── Library limitation ──
-    bulk_keychain library sirf 'market' aur 'limit' order types support
-    karti hai. 'st'/'tp' conditional tags library mein nahi hain.
-
-    ── Solution ──
-    sign_group() se teen orders ek atomic transaction mein:
-      - Entry:      market order
-      - Stop-Loss:  reduce_only GTC limit order at sl_price
-      - Take-Profit: reduce_only GTC limit order at tp_price
-
-    Yeh exchange pe correctly kaam karta hai — reduce_only orders
-    sirf open position ko close karenge.
+    sign_group se 3 orders ek saath:
+      - Entry:       market order
+      - Stop-Loss:   reduce_only GTC limit order
+      - Take-Profit: reduce_only GTC limit order
 
     Returns {"success": True/False, "message": "..."}
     """
-    coin      = signal["coin"]
+    coin      = signal["coin"].upper()
     direction = signal["direction"]   # "LONG" or "SHORT"
     leverage  = int(signal["leverage"])
     entry     = float(signal["entry"])
@@ -96,6 +98,15 @@ async def execute_trade(signal: dict) -> dict:
     sl_price  = float(signal["sl"])
     symbol    = _coin_to_symbol(coin)
     is_buy    = direction == "LONG"
+
+    # ── Coin supported check ──────────────────────────────────
+    if coin not in SUPPORTED_COINS:
+        msg = f"{coin} early.bulk.trade pe available nahi hai. Supported: {', '.join(SUPPORTED_COINS.keys())}"
+        logger.error(msg)
+        return {"success": False, "message": msg}
+
+    # ── Leverage clamp (coin-specific max) ────────────────────
+    leverage = _clamp_leverage(coin, leverage)
 
     size = _calculate_size(coin, entry, config.TRADE_SIZE_USDT)
     logger.info(
@@ -113,18 +124,11 @@ async def execute_trade(signal: dict) -> dict:
 
     # ── Step 2: Bracket order — Entry + SL + TP atomic ───────
     #
-    # LONG trade:
-    #   Entry  → buy  market
-    #   SL     → sell limit at sl_price  (below entry, reduce_only)
-    #   TP     → sell limit at tp_price  (above entry, reduce_only)
-    #
-    # SHORT trade:
-    #   Entry  → sell market
-    #   SL     → buy  limit at sl_price  (above entry, reduce_only)
-    #   TP     → buy  limit at tp_price  (below entry, reduce_only)
+    # LONG:  entry buy market | SL sell limit (neeche) | TP sell limit (upar)
+    # SHORT: entry sell market | SL buy limit (upar)   | TP buy limit (neeche)
 
     orders = [
-        # Entry: market order (price required by library for signing)
+        # Entry: market order (price field library signing ke liye required hai)
         {
             "type": "order",
             "symbol": symbol,
@@ -178,7 +182,7 @@ async def execute_trade(signal: dict) -> dict:
         FAILURE  = {"rejectedRiskLimit", "rejectedInvalid", "rejectedCrossing",
                     "rejectedDuplicate", "cancelledRiskLimit", "error"}
 
-        lines = []
+        lines           = []
         overall_success = True
 
         for i, st in enumerate(statuses):
@@ -193,7 +197,7 @@ async def execute_trade(signal: dict) -> dict:
                 if isinstance(status_val, dict):
                     reason = status_val.get("reason") or status_val.get("message") or ""
                 lines.append(f"❌ {label} failed: {status_key} — {reason}")
-                if i == 0:          # Entry fail = poora trade fail
+                if i == 0:
                     overall_success = False
                 logger.error(f"{label} rejected: {status_key} — {reason}")
             elif status_key == "cancelled":
