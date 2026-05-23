@@ -16,32 +16,21 @@ def _get_signer() -> Signer:
 
 
 def _coin_to_symbol(coin: str) -> str:
-    """Convert coin ticker to Bulk.trade symbol format."""
     return f"{coin.upper()}-USD"
-
-
-async def _send_transaction(tx: dict) -> dict:
-    """POST a signed transaction to Bulk.trade /order endpoint."""
-    async with httpx.AsyncClient(timeout=20) as client:
-        resp = await client.post(
-            f"{config.BULK_API_URL}/order",
-            json=tx,
-            headers={"Content-Type": "application/json"},
-        )
-        return resp.status_code, resp.json()
 
 
 async def execute_trade(signal: dict) -> dict:
     """
-    Execute a futures trade on Bulk.trade after admin approval.
+    Execute a bracket trade on Bulk.trade:
+      Step 1 — Leverage set karo (sign_user_settings)
+      Step 2 — Entry + SL + TP ek atomic transaction mein (sign_group)
 
-    Uses Bulk.trade's unified Transaction model with compact action tags:
-      - updateUserSettings : leverage set karo
-      - m                  : market order (entry)
-      - st                 : stop-loss conditional order
-      - tp                 : take-profit conditional order
+    Library supported order types:
+      - market : {'type': 'order', ..., 'order_type': {'type': 'market'}}
+      - limit  : {'type': 'order', ..., 'order_type': {'type': 'limit', 'tif': 'GTC'}}
 
-    Returns {"success": True/False, "message": "..."}
+    SL aur TP limit orders hain (reduce_only=True) — jab price SL/TP tak aaye
+    toh automatically fill ho jayenge (GTC resting limit orders).
     """
     coin      = signal["coin"]
     direction = signal["direction"]   # "LONG" or "SHORT"
@@ -53,7 +42,6 @@ async def execute_trade(signal: dict) -> dict:
 
     is_buy = direction == "LONG"
 
-    # Position size: USDT / entry price = coin units
     usdt_amount = config.TRADE_SIZE_USDT
     size = round(usdt_amount / entry, 6) if entry > 0 else 0.01
 
@@ -62,118 +50,93 @@ async def execute_trade(signal: dict) -> dict:
     except ValueError as e:
         return {"success": False, "message": str(e)}
 
-    results = []
-
     # ── Step 1: Leverage set karo ─────────────────────────────
-    # updateUserSettings action — m field mein symbol: leverage map
     try:
-        leverage_tx = signer.sign({
-            "actions": [
-                {
-                    "updateUserSettings": {
-                        "m": {symbol: float(leverage)}
-                    }
-                }
-            ]
-        })
-        status_code, data = await _send_transaction(leverage_tx)
-        if status_code in (200, 201):
+        leverage_tx = signer.sign_user_settings([(symbol, float(leverage))])
+        async with httpx.AsyncClient(timeout=20) as client:
+            resp = await client.post(
+                f"{config.BULK_API_URL}/order",
+                json=leverage_tx,
+                headers={"Content-Type": "application/json"},
+            )
+        data = resp.json()
+        if resp.status_code in (200, 201) and data.get("status") == "ok":
             logger.info(f"Leverage set to {leverage}x for {symbol}")
         else:
-            logger.warning(f"Leverage set failed: {status_code} {data}")
+            logger.warning(f"Leverage set failed: {resp.status_code} {data}")
     except Exception as e:
         logger.error(f"Leverage set exception: {e}")
+        # Leverage fail hone pe bhi trade try karte hain
 
-    # ── Step 2: Market entry order ────────────────────────────
-    # Action tag: "m" — fields: c, b, sz, r, i
-    # NOTE: Market order mein price field NAHI hoti (API docs ke mutabiq)
+    # ── Step 2: Bracket order — Entry + SL + TP atomic ───────
+    # LONG  → entry buy,  SL sell limit neeche, TP sell limit upar
+    # SHORT → entry sell, SL buy limit upar,    TP buy limit neeche
+    sl_is_buy = not is_buy   # LONG mein SL sell hai, SHORT mein buy
+    tp_is_buy = not is_buy   # same direction as SL
+
+    orders = [
+        # Entry: market order
+        {
+            "type": "order",
+            "symbol": symbol,
+            "is_buy": is_buy,
+            "price": entry,
+            "size": size,
+            "order_type": {"type": "market"},
+        },
+        # Stop-Loss: reduce-only limit order
+        {
+            "type": "order",
+            "symbol": symbol,
+            "is_buy": sl_is_buy,
+            "price": sl_price,
+            "size": size,
+            "reduce_only": True,
+            "order_type": {"type": "limit", "tif": "GTC"},
+        },
+        # Take-Profit: reduce-only limit order
+        {
+            "type": "order",
+            "symbol": symbol,
+            "is_buy": tp_is_buy,
+            "price": tp_price,
+            "size": size,
+            "reduce_only": True,
+            "order_type": {"type": "limit", "tif": "GTC"},
+        },
+    ]
+
     try:
-        entry_tx = signer.sign({
-            "actions": [
-                {
-                    "m": {
-                        "c": symbol,
-                        "b": is_buy,
-                        "sz": size,
-                        "r": False,
-                        "i": False,
-                    }
-                }
-            ]
-        })
-        status_code, data = await _send_transaction(entry_tx)
-        if status_code in (200, 201) and data.get("status") == "ok":
-            results.append("✅ Entry order placed")
-            logger.info(f"Entry order placed: {symbol} {direction} x{leverage}")
-        else:
+        bracket_tx = signer.sign_group(orders)
+        async with httpx.AsyncClient(timeout=20) as client:
+            resp = await client.post(
+                f"{config.BULK_API_URL}/order",
+                json=bracket_tx,
+                headers={"Content-Type": "application/json"},
+            )
+        data = resp.json()
+        logger.info(f"Bracket order response: {resp.status_code} {data}")
+
+        if resp.status_code not in (200, 201) or data.get("status") != "ok":
             msg = str(data)
-            logger.error(f"Entry order failed: {msg}")
-            return {"success": False, "message": f"Entry order failed: {msg}"}
-    except Exception as e:
-        logger.error(f"Entry order exception: {e}")
-        return {"success": False, "message": f"Entry order exception: {e}"}
+            logger.error(f"Bracket order failed: {msg}")
+            return {"success": False, "message": f"Trade failed: {msg}"}
 
-    # ── Step 3: Stop-loss order ───────────────────────────────
-    # Action tag: "st" — fields: c, d, sz, tr, lim, i
-    # d (direction): LONG ke liye SL neeche hota hai → trigger below → d=False
-    #                SHORT ke liye SL upar hota hai  → trigger above → d=True
-    try:
-        sl_direction = not is_buy   # LONG → False (trigger below), SHORT → True (trigger above)
-        sl_tx = signer.sign({
-            "actions": [
-                {
-                    "st": {
-                        "c": symbol,
-                        "d": sl_direction,
-                        "sz": size,
-                        "tr": sl_price,
-                        "lim": sl_price,  # limit = trigger (stop-limit style)
-                        "i": False,
-                    }
-                }
-            ]
-        })
-        status_code, data = await _send_transaction(sl_tx)
-        if status_code in (200, 201) and data.get("status") == "ok":
-            results.append("✅ Stop-loss placed")
-            logger.info(f"SL placed at {sl_price}")
-        else:
-            results.append(f"⚠️ SL failed: {data}")
-            logger.warning(f"SL order failed: {data}")
-    except Exception as e:
-        results.append(f"⚠️ SL exception: {e}")
-        logger.warning(f"SL exception: {e}")
+        # Response parse karo
+        statuses = data.get("response", {}).get("data", {}).get("statuses", [])
+        results = []
+        for i, st in enumerate(statuses):
+            label = ["Entry", "Stop-Loss", "Take-Profit"][i] if i < 3 else f"Order {i+1}"
+            if "filled" in st or "resting" in st or "working" in st:
+                results.append(f"✅ {label} placed")
+            elif "error" in st:
+                results.append(f"⚠️ {label} error: {st['error'].get('message', '?')}")
+            else:
+                results.append(f"✅ {label}: {list(st.keys())[0]}")
 
-    # ── Step 4: Take-profit order ─────────────────────────────
-    # Action tag: "tp" — fields: c, d, sz, tr, lim, i
-    # d (direction): LONG ke liye TP upar hota hai  → trigger above → d=True
-    #                SHORT ke liye TP neeche hota hai → trigger below → d=False
-    try:
-        tp_direction = is_buy   # LONG → True (trigger above), SHORT → False (trigger below)
-        tp_tx = signer.sign({
-            "actions": [
-                {
-                    "tp": {
-                        "c": symbol,
-                        "d": tp_direction,
-                        "sz": size,
-                        "tr": tp_price,
-                        "lim": tp_price,  # limit = trigger (take-profit-limit style)
-                        "i": False,
-                    }
-                }
-            ]
-        })
-        status_code, data = await _send_transaction(tp_tx)
-        if status_code in (200, 201) and data.get("status") == "ok":
-            results.append("✅ Take-profit placed")
-            logger.info(f"TP placed at {tp_price}")
-        else:
-            results.append(f"⚠️ TP failed: {data}")
-            logger.warning(f"TP order failed: {data}")
-    except Exception as e:
-        results.append(f"⚠️ TP exception: {e}")
-        logger.warning(f"TP exception: {e}")
+        logger.info(f"Trade executed: {symbol} {direction} x{leverage} | {' | '.join(results)}")
+        return {"success": True, "message": "\n".join(results)}
 
-    message = "\n".join(results)
-    return {"success": True, "message": message}
+    except Exception as e:
+        logger.error(f"Bracket order exception: {e}")
+        return {"success": False, "message": f"Trade exception: {e}"}
