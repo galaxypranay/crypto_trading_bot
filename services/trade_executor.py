@@ -20,41 +20,31 @@ def _coin_to_symbol(coin: str) -> str:
     return f"{coin.upper()}-USD"
 
 
-async def _set_leverage(signer: Signer, symbol: str, leverage: int) -> bool:
-    """Set leverage for a symbol before placing the order."""
-    try:
-        tx = signer.sign_user_settings([(symbol, float(leverage))])
-        async with httpx.AsyncClient(timeout=20) as client:
-            response = await client.post(
-                f"{config.BULK_API_URL}/order",
-                json=tx,
-                headers={"Content-Type": "application/json"},
-            )
-        if response.status_code in (200, 201):
-            logger.info(f"Leverage set to {leverage}x for {symbol}")
-            return True
-        else:
-            logger.warning(f"Leverage set failed: {response.status_code} {response.text}")
-            return False
-    except Exception as e:
-        logger.error(f"Leverage set exception: {e}")
-        return False
+async def _send_transaction(tx: dict) -> dict:
+    """POST a signed transaction to Bulk.trade /order endpoint."""
+    async with httpx.AsyncClient(timeout=20) as client:
+        resp = await client.post(
+            f"{config.BULK_API_URL}/order",
+            json=tx,
+            headers={"Content-Type": "application/json"},
+        )
+        return resp.status_code, resp.json()
 
 
 async def execute_trade(signal: dict) -> dict:
     """
     Execute a futures trade on Bulk.trade after admin approval.
 
-    Steps:
-      1. Set leverage for the symbol
-      2. Place market order (entry) — price field required by bulk_keychain signing
-      3. Place stop-loss order
-      4. Place take-profit order
+    Uses Bulk.trade's unified Transaction model with compact action tags:
+      - updateUserSettings : leverage set karo
+      - m                  : market order (entry)
+      - st                 : stop-loss conditional order
+      - tp                 : take-profit conditional order
 
     Returns {"success": True/False, "message": "..."}
     """
     coin      = signal["coin"]
-    direction = signal["direction"]       # "LONG" or "SHORT"
+    direction = signal["direction"]   # "LONG" or "SHORT"
     leverage  = int(signal["leverage"])
     entry     = float(signal["entry"])
     tp_price  = float(signal["tp"])
@@ -63,7 +53,7 @@ async def execute_trade(signal: dict) -> dict:
 
     is_buy = direction == "LONG"
 
-    # Position size: use a fixed USDT amount from config, convert to coin units
+    # Position size: USDT / entry price = coin units
     usdt_amount = config.TRADE_SIZE_USDT
     size = round(usdt_amount / entry, 6) if entry > 0 else 0.01
 
@@ -72,108 +62,118 @@ async def execute_trade(signal: dict) -> dict:
     except ValueError as e:
         return {"success": False, "message": str(e)}
 
-    # ── Step 1: Set leverage ──────────────────────────────────
-    await _set_leverage(signer, symbol, leverage)
-
-    # ── Step 2: Entry market order ────────────────────────────
-    # FIX: bulk_keychain signer.sign() requires 'price' field even for market orders.
-    # We pass the entry price so the signing payload is complete.
-    entry_order = {
-        "type": "order",
-        "symbol": symbol,
-        "is_buy": is_buy,
-        "price": entry,          # ← FIX: required by bulk_keychain for signing
-        "size": size,
-        "order_type": {"type": "market"},
-    }
-
-    # ── Step 3: Stop-loss order ───────────────────────────────
-    sl_order = {
-        "type": "order",
-        "symbol": symbol,
-        "is_buy": not is_buy,
-        "price": sl_price,
-        "size": size,
-        "reduce_only": True,
-        "order_type": {
-            "type": "stop",
-            "trigger": sl_price,
-        },
-    }
-
-    # ── Step 4: Take-profit order ─────────────────────────────
-    tp_order = {
-        "type": "order",
-        "symbol": symbol,
-        "is_buy": not is_buy,
-        "price": tp_price,
-        "size": size,
-        "reduce_only": True,
-        "order_type": {
-            "type": "take_profit",
-            "trigger": tp_price,
-        },
-    }
-
     results = []
 
-    async with httpx.AsyncClient(timeout=20) as client:
+    # ── Step 1: Leverage set karo ─────────────────────────────
+    # updateUserSettings action — m field mein symbol: leverage map
+    try:
+        leverage_tx = signer.sign({
+            "actions": [
+                {
+                    "updateUserSettings": {
+                        "m": {symbol: float(leverage)}
+                    }
+                }
+            ]
+        })
+        status_code, data = await _send_transaction(leverage_tx)
+        if status_code in (200, 201):
+            logger.info(f"Leverage set to {leverage}x for {symbol}")
+        else:
+            logger.warning(f"Leverage set failed: {status_code} {data}")
+    except Exception as e:
+        logger.error(f"Leverage set exception: {e}")
 
-        # Send entry order
-        try:
-            tx_entry = signer.sign(entry_order)
-            resp = await client.post(
-                f"{config.BULK_API_URL}/order",
-                json=tx_entry,
-                headers={"Content-Type": "application/json"},
-            )
-            data = resp.json()
-            if resp.status_code in (200, 201):
-                results.append("✅ Entry order placed")
-                logger.info(f"Entry order placed: {symbol} {direction} x{leverage}")
-            else:
-                msg = data.get("message", resp.text)
-                logger.error(f"Entry order failed: {msg}")
-                return {"success": False, "message": f"Entry order failed: {msg}"}
-        except Exception as e:
-            logger.error(f"Entry order exception: {e}")
-            return {"success": False, "message": f"Entry order exception: {e}"}
+    # ── Step 2: Market entry order ────────────────────────────
+    # Action tag: "m" — fields: c, b, sz, r, i
+    # NOTE: Market order mein price field NAHI hoti (API docs ke mutabiq)
+    try:
+        entry_tx = signer.sign({
+            "actions": [
+                {
+                    "m": {
+                        "c": symbol,
+                        "b": is_buy,
+                        "sz": size,
+                        "r": False,
+                        "i": False,
+                    }
+                }
+            ]
+        })
+        status_code, data = await _send_transaction(entry_tx)
+        if status_code in (200, 201) and data.get("status") == "ok":
+            results.append("✅ Entry order placed")
+            logger.info(f"Entry order placed: {symbol} {direction} x{leverage}")
+        else:
+            msg = str(data)
+            logger.error(f"Entry order failed: {msg}")
+            return {"success": False, "message": f"Entry order failed: {msg}"}
+    except Exception as e:
+        logger.error(f"Entry order exception: {e}")
+        return {"success": False, "message": f"Entry order exception: {e}"}
 
-        # Send stop-loss
-        try:
-            tx_sl = signer.sign(sl_order)
-            resp = await client.post(
-                f"{config.BULK_API_URL}/order",
-                json=tx_sl,
-                headers={"Content-Type": "application/json"},
-            )
-            if resp.status_code in (200, 201):
-                results.append("✅ Stop-loss placed")
-                logger.info(f"SL placed at {sl_price}")
-            else:
-                results.append(f"⚠️ SL failed: {resp.text[:80]}")
-                logger.warning(f"SL order failed: {resp.text}")
-        except Exception as e:
-            results.append(f"⚠️ SL exception: {e}")
-            logger.warning(f"SL exception: {e}")
+    # ── Step 3: Stop-loss order ───────────────────────────────
+    # Action tag: "st" — fields: c, d, sz, tr, lim, i
+    # d (direction): LONG ke liye SL neeche hota hai → trigger below → d=False
+    #                SHORT ke liye SL upar hota hai  → trigger above → d=True
+    try:
+        sl_direction = not is_buy   # LONG → False (trigger below), SHORT → True (trigger above)
+        sl_tx = signer.sign({
+            "actions": [
+                {
+                    "st": {
+                        "c": symbol,
+                        "d": sl_direction,
+                        "sz": size,
+                        "tr": sl_price,
+                        "lim": sl_price,  # limit = trigger (stop-limit style)
+                        "i": False,
+                    }
+                }
+            ]
+        })
+        status_code, data = await _send_transaction(sl_tx)
+        if status_code in (200, 201) and data.get("status") == "ok":
+            results.append("✅ Stop-loss placed")
+            logger.info(f"SL placed at {sl_price}")
+        else:
+            results.append(f"⚠️ SL failed: {data}")
+            logger.warning(f"SL order failed: {data}")
+    except Exception as e:
+        results.append(f"⚠️ SL exception: {e}")
+        logger.warning(f"SL exception: {e}")
 
-        # Send take-profit
-        try:
-            tx_tp = signer.sign(tp_order)
-            resp = await client.post(
-                f"{config.BULK_API_URL}/order",
-                json=tx_tp,
-                headers={"Content-Type": "application/json"},
-            )
-            if resp.status_code in (200, 201):
-                results.append("✅ Take-profit placed")
-                logger.info(f"TP placed at {tp_price}")
-            else:
-                results.append(f"⚠️ TP failed: {resp.text[:80]}")
-                logger.warning(f"TP order failed: {resp.text}")
-        except Exception as e:
-            results.append(f"⚠️ TP exception: {e}")
-            logger.warning(f"TP exception: {e}")
+    # ── Step 4: Take-profit order ─────────────────────────────
+    # Action tag: "tp" — fields: c, d, sz, tr, lim, i
+    # d (direction): LONG ke liye TP upar hota hai  → trigger above → d=True
+    #                SHORT ke liye TP neeche hota hai → trigger below → d=False
+    try:
+        tp_direction = is_buy   # LONG → True (trigger above), SHORT → False (trigger below)
+        tp_tx = signer.sign({
+            "actions": [
+                {
+                    "tp": {
+                        "c": symbol,
+                        "d": tp_direction,
+                        "sz": size,
+                        "tr": tp_price,
+                        "lim": tp_price,  # limit = trigger (take-profit-limit style)
+                        "i": False,
+                    }
+                }
+            ]
+        })
+        status_code, data = await _send_transaction(tp_tx)
+        if status_code in (200, 201) and data.get("status") == "ok":
+            results.append("✅ Take-profit placed")
+            logger.info(f"TP placed at {tp_price}")
+        else:
+            results.append(f"⚠️ TP failed: {data}")
+            logger.warning(f"TP order failed: {data}")
+    except Exception as e:
+        results.append(f"⚠️ TP exception: {e}")
+        logger.warning(f"TP exception: {e}")
 
     message = "\n".join(results)
     return {"success": True, "message": message}
