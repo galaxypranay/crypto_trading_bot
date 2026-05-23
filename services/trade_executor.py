@@ -47,13 +47,13 @@ async def execute_trade(signal: dict) -> dict:
 
     Steps:
       1. Set leverage for the symbol
-      2. Place market order (entry)
+      2. Place market order (entry) — price field required by bulk_keychain signing
       3. Place stop-loss order
       4. Place take-profit order
 
     Returns {"success": True/False, "message": "..."}
     """
-    coin     = signal["coin"]
+    coin      = signal["coin"]
     direction = signal["direction"]       # "LONG" or "SHORT"
     leverage  = int(signal["leverage"])
     entry     = float(signal["entry"])
@@ -64,7 +64,6 @@ async def execute_trade(signal: dict) -> dict:
     is_buy = direction == "LONG"
 
     # Position size: use a fixed USDT amount from config, convert to coin units
-    # Size in coins = USDT_amount / entry_price
     usdt_amount = config.TRADE_SIZE_USDT
     size = round(usdt_amount / entry, 6) if entry > 0 else 0.01
 
@@ -77,16 +76,18 @@ async def execute_trade(signal: dict) -> dict:
     await _set_leverage(signer, symbol, leverage)
 
     # ── Step 2: Entry market order ────────────────────────────
+    # FIX: bulk_keychain signer.sign() requires 'price' field even for market orders.
+    # We pass the entry price so the signing payload is complete.
     entry_order = {
         "type": "order",
         "symbol": symbol,
         "is_buy": is_buy,
+        "price": entry,          # ← FIX: required by bulk_keychain for signing
         "size": size,
         "order_type": {"type": "market"},
     }
 
     # ── Step 3: Stop-loss order ───────────────────────────────
-    # Stop is opposite direction (reduce only)
     sl_order = {
         "type": "order",
         "symbol": symbol,
