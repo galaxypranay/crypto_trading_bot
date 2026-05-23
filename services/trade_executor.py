@@ -206,8 +206,24 @@ async def execute_trade(signal: dict) -> dict:
                 json=bracket_tx,
                 headers={"Content-Type": "application/json"},
             )
-        data = resp.json()
-        logger.info(f"Bracket response: {resp.status_code} | {data}")
+
+        # Empty response body handle karo
+        raw_text = resp.text.strip()
+        logger.info(f"Bracket response: {resp.status_code} | body={raw_text[:300]}")
+
+        if not raw_text:
+            return {
+                "success": False,
+                "message": f"Exchange returned empty response (HTTP {resp.status_code}). Account mein funds nahi hain ya staging issue hai."
+            }
+
+        try:
+            data = resp.json()
+        except Exception as json_err:
+            return {
+                "success": False,
+                "message": f"Invalid JSON response (HTTP {resp.status_code}): {raw_text[:200]}"
+            }
 
         if resp.status_code not in (200, 201):
             return {"success": False, "message": f"API error {resp.status_code}: {data}"}
