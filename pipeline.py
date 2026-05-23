@@ -4,7 +4,7 @@ import asyncio
 from services.news_fetcher import fetch_coingecko_news
 from services.ai_analyzer import generate_description, analyze_news, pick_best_signal
 from services.database import is_seen, mark_seen, is_too_old, log_news
-from handlers.news_bot import post_news_to_channel, send_error_to_channel
+from handlers.news_bot import post_news_to_channel
 from handlers.trade_bot import send_signal_to_admin, send_error_to_admin
 import config
 
@@ -13,13 +13,14 @@ logger = logging.getLogger(__name__)
 
 async def run_pipeline():
     """
-    Pipeline:
-    1. RSS feeds se coin-related news fetch karo
+    Main pipeline — har 2 minute mein chalta hai:
+
+    1. CoinGecko + RSS se fresh coin news fetch karo
     2. Purani news (6 ghante se zyada) skip karo
-    3. DB se check — duplicate skip karo
-    4. FreeModel se description → channel post
-    5. FreeModel se trade signal
-    6. Best signal → admin trade bot
+    3. DB se duplicate check karo
+    4. OpenRouter se AI description banao → channel pe post karo
+    5. FreeModel se trade signal analyze karo
+    6. Best signal (highest confidence) → admin ko bhejo
     """
     logger.info("Pipeline triggered — fetching news...")
 
@@ -31,75 +32,100 @@ async def run_pipeline():
         await send_error_to_admin(error)
         return
 
-    # Filter: naye + fresh articles sirf
+    if not all_news:
+        logger.info("No articles fetched from any source.")
+        return
+
+    # ── Filter: sirf naye aur fresh articles ─────────────────
     new_articles = []
     for article in all_news:
-
-        # 1. Purani news skip karo
+        # Purani news skip (6 ghante se zyada)
         if is_too_old(article["published_at"]):
-            logger.info(f"Too old — skip: {article['title'][:50]}")
-            await mark_seen(article["id"])  # future mein bhi skip ho
+            # Silent skip — log spam se bachne ke liye sirf already-seen nahi hain unhe mark karo
+            if not await is_seen(article["id"]):
+                await mark_seen(article["id"])
             continue
 
-        # 2. Duplicate check
+        # Duplicate check
         if await is_seen(article["id"]):
             continue
 
         new_articles.append(article)
 
     if not new_articles:
-        logger.info("No new fresh articles.")
+        logger.info("No new fresh articles found.")
         return
 
-    logger.info(f"{len(new_articles)} new fresh articles found.")
+    logger.info(f"{len(new_articles)} new fresh article(s) found.")
 
     signals = []
 
     for article in new_articles:
-        # Turant mark karo — reprocessing rokne ke liye
+        # Turant mark karo — concurrent runs mein duplicate processing se bacho
         await mark_seen(article["id"])
 
-        logger.info(f"Processing [{article['coin']}]: {article['title'][:55]}")
+        coin   = article["coin"]
+        title  = article["title"][:60]
+        source = article.get("from_source", "unknown")
+        logger.info(f"Processing [{coin}] ({source}): {title}")
 
-        # Step 1: AI description generate karo
+        # ── Step 1: OpenRouter se AI description generate karo ─
         try:
             description = await generate_description(article)
         except Exception as e:
-            logger.error(f"Description error: {e}")
-            description = article.get("description", article["title"])
+            logger.error(f"Description error [{coin}]: {e}")
+            description = article.get("description") or article["title"]
 
-        # Step 2: Channel mein post karo + DB mein log karo
-        posted = await post_news_to_channel(article, description)
-        if posted:
-            await log_news(article)
+        # ── Step 2: Telegram channel mein post karo ───────────
+        try:
+            posted = await post_news_to_channel(article, description)
+            if posted:
+                await log_news(article)
+                logger.info(f"Channel post success: [{coin}] {title}")
+            else:
+                logger.warning(f"Channel post failed: [{coin}] {title}")
+        except Exception as e:
+            logger.error(f"Channel post exception [{coin}]: {e}")
 
-        await asyncio.sleep(1.5)  # Telegram rate limit
+        # Telegram rate limit se bachne ke liye wait
+        await asyncio.sleep(2)
 
-        # Step 3: Trade signal analyze karo
+        # ── Step 3: FreeModel se trade signal analyze karo ────
         try:
             signal = await analyze_news(article)
         except Exception as e:
-            logger.error(f"Signal analysis error: {e}")
+            logger.error(f"Signal analysis error [{coin}]: {e}")
             continue
 
         if not signal:
+            logger.info(f"No signal returned for [{coin}]")
             continue
 
         if signal.get("tradeable"):
             logger.info(
                 f"Signal: {signal.get('coin')} {signal.get('direction')} "
-                f"@ {signal.get('confidence')}%"
+                f"@ {signal.get('confidence')}% | lev={signal.get('leverage')}x"
             )
             signals.append(signal)
         else:
-            logger.info(f"Not tradeable: {signal.get('reason', '—')}")
+            logger.info(f"Not tradeable [{coin}]: {signal.get('reason', '—')}")
 
-    # Best signal admin ko bhejo
-    best = pick_best_signal(signals)
-    if best:
-        logger.info(
-            f"Best → {best['coin']} {best['direction']} @ {best['confidence']}%"
-        )
-        await send_signal_to_admin(best)
+        # API rate limit
+        await asyncio.sleep(1)
+
+    # ── Step 4: Best signal admin ko bhejo ───────────────────
+    if signals:
+        best = pick_best_signal(signals)
+        if best:
+            logger.info(
+                f"Best signal → {best['coin']} {best['direction']} "
+                f"@ {best['confidence']}% | lev={best['leverage']}x"
+            )
+            await send_signal_to_admin(best)
+        else:
+            logger.info(
+                f"No valid signal above {config.MIN_CONFIDENCE}% confidence threshold. "
+                f"({len(signals)} signal(s) analyzed)"
+            )
     else:
-        logger.info(f"No signal above {config.MIN_CONFIDENCE}% threshold.")
+        logger.info("No tradeable signals found in this batch.")
