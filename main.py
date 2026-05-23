@@ -10,7 +10,7 @@ import config
 from config import validate_config
 from pipeline import run_pipeline
 from services.database import init_db, close_db, cleanup_old_seen_news
-from handlers.trade_bot import get_trade_app, restore_pending_signals
+from handlers.trade_bot import get_trade_app, restore_pending_signals, start_timeout_checker
 from handlers.news_bot import get_news_app
 
 logging.basicConfig(
@@ -46,6 +46,7 @@ async def lifespan(app: FastAPI):
 
     # DB se pending signals restore karo (restart-safe)
     await restore_pending_signals()
+    start_timeout_checker()  # 5-min amount timeout checker
 
     # ── News Bot start ────────────────────────────────────────
     news_app = get_news_app()
