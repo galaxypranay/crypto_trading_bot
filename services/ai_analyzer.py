@@ -143,8 +143,12 @@ async def _call_freemodel(user_prompt: str, max_tokens: int = 350) -> Optional[s
 async def generate_description(news_item: dict) -> str:
     """
     OpenRouter se news ka punchy channel description generate karo.
-    Fallback: original title + description use karo.
+    Agar OpenRouter fail ya rate limit ho → simple fallback use karo (no retry).
     """
+    # Agar API key hi nahi hai toh directly fallback
+    if not config.OPENROUTER_API_KEY:
+        return _simple_description(news_item)
+
     user_msg = (
         f"Coin: {news_item['coin']}\n"
         f"News Title: {news_item['title']}\n"
@@ -156,10 +160,27 @@ async def generate_description(news_item: dict) -> str:
         logger.info(f"OpenRouter description generated for [{news_item['coin']}]")
         return result
 
-    # Fallback — original content use karo
-    logger.warning(f"OpenRouter failed, using fallback for [{news_item['coin']}]")
-    desc = news_item.get("description", "")
-    return desc if desc else news_item["title"]
+    # Fallback — OpenRouter fail/rate-limit hua, simple description use karo
+    logger.warning(f"OpenRouter unavailable [{news_item['coin']}] — posting without AI description")
+    return _simple_description(news_item)
+
+
+def _simple_description(news_item: dict) -> str:
+    """OpenRouter ke bina simple channel description banao."""
+    coin  = news_item["coin"]
+    desc  = news_item.get("description", "").strip()
+    title = news_item["title"].strip()
+    source = news_item.get("source", "")
+
+    # Description available hai toh use karo, warna sirf title
+    body = desc[:280] + "..." if len(desc) > 280 else desc
+    if not body:
+        body = title
+
+    lines = [f"#{coin} update 📌", "", body]
+    if source:
+        lines.append(f"\n📡 {source}")
+    return "\n".join(lines)
 
 
 async def analyze_news(news_item: dict) -> Optional[dict]:
