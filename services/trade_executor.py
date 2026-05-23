@@ -5,25 +5,26 @@ import config
 
 logger = logging.getLogger(__name__)
 
-# ── early.bulk.trade pe available coins aur unka max leverage ─
+# ── early.bulk.trade supported coins ─────────────────────────
+# max_leverage = exchange ka hard limit per coin
 SUPPORTED_COINS = {
-    "BTC":      {"max_leverage": 50, "min_size": 0.001},
-    "ETH":      {"max_leverage": 50, "min_size": 0.01},
-    "SOL":      {"max_leverage": 50, "min_size": 0.1},
-    "XRP":      {"max_leverage": 50, "min_size": 10.0},
-    "SUI":      {"max_leverage": 40, "min_size": 10.0},
-    "BNB":      {"max_leverage": 40, "min_size": 0.01},
-    "ZEC":      {"max_leverage": 40, "min_size": 0.01},
-    "DOGE":     {"max_leverage": 10, "min_size": 100.0},
-    "FARTCOIN": {"max_leverage": 25, "min_size": 10.0},
+    "BTC":      {"max_leverage": 50,  "min_size": 0.001},
+    "ETH":      {"max_leverage": 50,  "min_size": 0.01},
+    "SOL":      {"max_leverage": 50,  "min_size": 0.1},
+    "XRP":      {"max_leverage": 50,  "min_size": 10.0},
+    "SUI":      {"max_leverage": 40,  "min_size": 10.0},
+    "BNB":      {"max_leverage": 40,  "min_size": 0.01},
+    "ZEC":      {"max_leverage": 40,  "min_size": 0.01},
+    "DOGE":     {"max_leverage": 10,  "min_size": 100.0},
+    "FARTCOIN": {"max_leverage": 25,  "min_size": 10.0},
 }
 
 
 def _get_signer() -> Signer:
-    private_key_b58 = config.BULK_PRIVATE_KEY
-    if not private_key_b58:
+    pk = config.BULK_PRIVATE_KEY
+    if not pk:
         raise ValueError("BULK_PRIVATE_KEY is not set.")
-    return Signer(Keypair.from_base58(private_key_b58))
+    return Signer(Keypair.from_base58(pk))
 
 
 def _coin_to_symbol(coin: str) -> str:
@@ -31,30 +32,36 @@ def _coin_to_symbol(coin: str) -> str:
 
 
 def _calculate_size(coin: str, entry: float, usdt_amount: float) -> float:
-    """USDT amount se coin size calculate karo with minimum size enforcement."""
-    coin_info = SUPPORTED_COINS.get(coin.upper(), {})
-    min_size  = coin_info.get("min_size", 0.01)
+    """USDT amount se coin size calculate karo with min size enforcement."""
+    min_size = SUPPORTED_COINS.get(coin.upper(), {}).get("min_size", 0.01)
     if entry <= 0:
         return min_size
     size = round(usdt_amount / entry, 6)
     if size < min_size:
-        logger.warning(f"Size {size} too small for {coin}, using minimum {min_size}")
+        logger.warning(f"Size {size} too small for {coin}, using min {min_size}")
         size = min_size
     return size
 
 
 def _clamp_leverage(coin: str, leverage: int) -> int:
-    """Coin ke max leverage se clamp karo."""
-    coin_info   = SUPPORTED_COINS.get(coin.upper(), {})
-    max_allowed = coin_info.get("max_leverage", 50)
-    clamped     = min(leverage, max_allowed)
-    if clamped != leverage:
-        logger.warning(f"Leverage clamped {leverage}x → {clamped}x (max for {coin}: {max_allowed}x)")
-    return clamped
+    """
+    Leverage 3 jagah se clamp karo:
+    1. RISK_MODE ka max (config.py mein)
+    2. Coin ka exchange max (SUPPORTED_COINS mein)
+    3. Hard limit 50x
+    """
+    risk_max  = config.LEVERAGE_MAP.get(config.RISK_MODE, {}).get("max", 50)
+    coin_max  = SUPPORTED_COINS.get(coin.upper(), {}).get("max_leverage", 50)
+    effective = min(leverage, risk_max, coin_max, 50)
+    if effective != leverage:
+        logger.warning(
+            f"Leverage clamped: {leverage}x → {effective}x "
+            f"(risk_max={risk_max}, coin_max={coin_max})"
+        )
+    return effective
 
 
 async def _set_leverage(signer: Signer, symbol: str, leverage: int) -> bool:
-    """Leverage set karo."""
     try:
         tx = signer.sign_user_settings([(symbol, float(leverage))])
         async with httpx.AsyncClient(timeout=20) as client:
@@ -67,9 +74,8 @@ async def _set_leverage(signer: Signer, symbol: str, leverage: int) -> bool:
         if resp.status_code in (200, 201) and data.get("status") == "ok":
             logger.info(f"Leverage set: {symbol} → {leverage}x")
             return True
-        else:
-            logger.warning(f"Leverage set failed: {resp.status_code} | {data}")
-            return False
+        logger.warning(f"Leverage set failed: {resp.status_code} | {data}")
+        return False
     except Exception as e:
         logger.error(f"Leverage set exception: {e}")
         return False
@@ -79,19 +85,21 @@ async def execute_trade(signal: dict) -> dict:
     """
     Execute bracket trade on early.bulk.trade.
 
-    Step 1: Coin supported hai check karo
-    Step 2: Leverage set karo (sign_user_settings)
-    Step 3: Entry + SL + TP atomic transaction (sign_group)
+    Trade size:
+      - signal['trade_size_usdt'] — admin ne approve ke waqt choose kiya
+      - fallback: config.TRADE_SIZE_USDT (Railway variable)
 
-    sign_group se 3 orders ek saath:
-      - Entry:       market order
-      - Stop-Loss:   reduce_only GTC limit order
-      - Take-Profit: reduce_only GTC limit order
-
-    Returns {"success": True/False, "message": "..."}
+    Steps:
+      1. Coin supported check
+      2. Leverage clamp (risk mode + coin max)
+      3. Leverage set (sign_user_settings)
+      4. Bracket order atomic (sign_group):
+         - Entry:  market order
+         - SL:     reduce_only GTC limit
+         - TP:     reduce_only GTC limit
     """
     coin      = signal["coin"].upper()
-    direction = signal["direction"]   # "LONG" or "SHORT"
+    direction = signal["direction"]
     leverage  = int(signal["leverage"])
     entry     = float(signal["entry"])
     tp_price  = float(signal["tp"])
@@ -99,19 +107,25 @@ async def execute_trade(signal: dict) -> dict:
     symbol    = _coin_to_symbol(coin)
     is_buy    = direction == "LONG"
 
+    # Admin ka chosen amount, fallback to config
+    usdt_amount = float(signal.get("trade_size_usdt") or config.TRADE_SIZE_USDT)
+
     # ── Coin supported check ──────────────────────────────────
     if coin not in SUPPORTED_COINS:
-        msg = f"{coin} early.bulk.trade pe available nahi hai. Supported: {', '.join(SUPPORTED_COINS.keys())}"
+        msg = (
+            f"{coin} early.bulk.trade pe available nahi.\n"
+            f"Supported: {', '.join(SUPPORTED_COINS.keys())}"
+        )
         logger.error(msg)
         return {"success": False, "message": msg}
 
-    # ── Leverage clamp (coin-specific max) ────────────────────
     leverage = _clamp_leverage(coin, leverage)
+    size     = _calculate_size(coin, entry, usdt_amount)
 
-    size = _calculate_size(coin, entry, config.TRADE_SIZE_USDT)
     logger.info(
         f"Trade: {symbol} {direction} x{leverage} | "
-        f"size={size} | entry={entry} | tp={tp_price} | sl={sl_price}"
+        f"size={size} | entry={entry} | tp={tp_price} | sl={sl_price} | "
+        f"usdt={usdt_amount}"
     )
 
     try:
@@ -119,41 +133,34 @@ async def execute_trade(signal: dict) -> dict:
     except ValueError as e:
         return {"success": False, "message": str(e)}
 
-    # ── Step 1: Leverage ──────────────────────────────────────
+    # ── Leverage set ──────────────────────────────────────────
     await _set_leverage(signer, symbol, leverage)
 
-    # ── Step 2: Bracket order — Entry + SL + TP atomic ───────
-    #
-    # LONG:  entry buy market | SL sell limit (neeche) | TP sell limit (upar)
-    # SHORT: entry sell market | SL buy limit (upar)   | TP buy limit (neeche)
-
+    # ── Bracket order ─────────────────────────────────────────
     orders = [
-        # Entry: market order (price field library signing ke liye required hai)
         {
-            "type": "order",
-            "symbol": symbol,
-            "is_buy": is_buy,
-            "price": entry,
-            "size": size,
+            "type":       "order",
+            "symbol":     symbol,
+            "is_buy":     is_buy,
+            "price":      entry,
+            "size":       size,
             "order_type": {"type": "market"},
         },
-        # Stop-Loss: reduce_only GTC limit
         {
-            "type": "order",
-            "symbol": symbol,
-            "is_buy": not is_buy,
-            "price": sl_price,
-            "size": size,
+            "type":       "order",
+            "symbol":     symbol,
+            "is_buy":     not is_buy,
+            "price":      sl_price,
+            "size":       size,
             "reduce_only": True,
             "order_type": {"type": "limit", "tif": "GTC"},
         },
-        # Take-Profit: reduce_only GTC limit
         {
-            "type": "order",
-            "symbol": symbol,
-            "is_buy": not is_buy,
-            "price": tp_price,
-            "size": size,
+            "type":       "order",
+            "symbol":     symbol,
+            "is_buy":     not is_buy,
+            "price":      tp_price,
+            "size":       size,
             "reduce_only": True,
             "order_type": {"type": "limit", "tif": "GTC"},
         },
@@ -168,7 +175,7 @@ async def execute_trade(signal: dict) -> dict:
                 headers={"Content-Type": "application/json"},
             )
         data = resp.json()
-        logger.info(f"Bracket order response: {resp.status_code} | {data}")
+        logger.info(f"Bracket response: {resp.status_code} | {data}")
 
         if resp.status_code not in (200, 201):
             return {"success": False, "message": f"API error {resp.status_code}: {data}"}
@@ -193,9 +200,8 @@ async def execute_trade(signal: dict) -> dict:
             if status_key in SUCCESS:
                 lines.append(f"✅ {label} placed")
             elif status_key in FAILURE:
-                reason = ""
-                if isinstance(status_val, dict):
-                    reason = status_val.get("reason") or status_val.get("message") or ""
+                reason = (status_val.get("reason") or status_val.get("message") or "") \
+                         if isinstance(status_val, dict) else ""
                 lines.append(f"❌ {label} failed: {status_key} — {reason}")
                 if i == 0:
                     overall_success = False
@@ -206,8 +212,8 @@ async def execute_trade(signal: dict) -> dict:
                 lines.append(f"ℹ️ {label}: {status_key}")
 
         logger.info(
-            f"Trade complete: {symbol} {direction} x{leverage} | "
-            f"success={overall_success} | {' | '.join(lines)}"
+            f"Trade done: {symbol} {direction} x{leverage} ${usdt_amount} | "
+            f"success={overall_success}"
         )
         return {"success": overall_success, "message": "\n".join(lines)}
 
