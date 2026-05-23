@@ -6,15 +6,13 @@ from telegram.error import TelegramError
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 import config
 from services.trade_executor import execute_trade
+from services.database import log_trade
 
 logger = logging.getLogger(__name__)
 
 _trade_app: Application = None
-
-# In-memory store: unique_id → signal dict
 pending_signals: dict[str, dict] = {}
 
-# Dummy signal for /test command
 TEST_SIGNAL = {
     "tradeable": True,
     "coin": "BTC",
@@ -48,7 +46,6 @@ def get_trade_app() -> Application:
 def format_signal_message(signal: dict) -> str:
     direction_emoji = "🟢" if signal["direction"] == "LONG" else "🔴"
     test_badge = "🧪 *TEST SIGNAL*\n" if signal.get("is_test") else ""
-
     return (
         f"{test_badge}"
         f"{direction_emoji} *{signal['coin']} {signal['direction']}*\n"
@@ -91,7 +88,7 @@ async def send_signal_to_admin(signal: dict) -> bool:
         logger.info(f"Signal sent to admin: {signal['coin']} {signal['direction']}")
         return True
     except TelegramError as e:
-        logger.error(f"Failed to send signal to admin: {e}")
+        logger.error(f"Failed to send signal: {e}")
         return False
 
 
@@ -143,6 +140,9 @@ async def handle_approval_callback(update: Update, context: ContextTypes.DEFAULT
                 parse_mode=ParseMode.MARKDOWN,
             )
             result = await execute_trade(signal)
+            status = "approved" if result["success"] else "failed"
+            await log_trade(signal, status)
+
             if result["success"]:
                 await query.edit_message_text(
                     f"✅ *Trade Executed!*\n\n"
@@ -159,6 +159,8 @@ async def handle_approval_callback(update: Update, context: ContextTypes.DEFAULT
                 )
 
     elif action == "reject":
+        if not signal.get("is_test"):
+            await log_trade(signal, "rejected")
         label = "Test Rejected" if signal.get("is_test") else "Trade Rejected"
         await query.edit_message_text(
             f"🚫 *{label}*\n\n"
@@ -180,4 +182,4 @@ async def send_error_to_admin(error_msg: str):
             parse_mode=ParseMode.MARKDOWN,
         )
     except TelegramError as e:
-        logger.error(f"Failed to send error to admin: {e}")
+        logger.error(f"Failed to send error: {e}")
