@@ -18,19 +18,21 @@ _trade_app: Application = None
 # In-memory cache (fast lookup) + DB backup (restart-safe)
 pending_signals: dict[str, dict] = {}
 
+# TEST SIGNAL — is_test=True hone se real trade execute nahi hoga
+# Entry price 0 rakha — test mein real trade nahi hota toh price matter nahi
 TEST_SIGNAL = {
-    "tradeable": True,
-    "coin": "BTC",
-    "direction": "LONG",
-    "confidence": 95,
-    "leverage": 20,
-    "entry": 67000,
-    "tp": 68500,
-    "sl": 66000,
-    "reason": "TEST MODE — system check, koi real trade nahi hoga.",
-    "news_title": "Test Signal",
+    "tradeable":   True,
+    "coin":        "BTC",
+    "direction":   "LONG",
+    "confidence":  95,
+    "leverage":    15,
+    "entry":       0,
+    "tp":          0,
+    "sl":          0,
+    "reason":      "TEST MODE — system check, koi real trade nahi hoga.",
+    "news_title":  "Test Signal",
     "news_source": "Manual /test command",
-    "is_test": True,
+    "is_test":     True,
 }
 
 
@@ -43,9 +45,10 @@ def get_trade_app() -> Application:
             .build()
         )
         _trade_app.add_handler(CallbackQueryHandler(handle_approval_callback))
-        _trade_app.add_handler(CommandHandler("test",   handle_test_command))
-        _trade_app.add_handler(CommandHandler("start",  handle_start_command))
-        _trade_app.add_handler(CommandHandler("status", handle_status_command))
+        _trade_app.add_handler(CommandHandler("test",    handle_test_command))
+        _trade_app.add_handler(CommandHandler("start",   handle_start_command))
+        _trade_app.add_handler(CommandHandler("status",  handle_status_command))
+        _trade_app.add_handler(CommandHandler("balance", handle_balance_command))
     return _trade_app
 
 
@@ -62,20 +65,26 @@ def format_signal_message(signal: dict) -> str:
     direction_emoji = "🟢" if signal["direction"] == "LONG" else "🔴"
     test_badge      = "🧪 *TEST SIGNAL*\n" if signal.get("is_test") else ""
     risk            = config.RISK_MODE
-    leverage_range  = config.LEVERAGE_MAP.get(risk, {})
 
     # Risk/reward ratio
     try:
         entry = float(signal["entry"])
         tp    = float(signal["tp"])
         sl    = float(signal["sl"])
-        if signal["direction"] == "LONG":
-            rr = abs(tp - entry) / abs(entry - sl)
+        if entry > 0:
+            if signal["direction"] == "LONG":
+                rr = abs(tp - entry) / abs(entry - sl)
+            else:
+                rr = abs(entry - tp) / abs(sl - entry)
+            rr_str = f"`{rr:.1f}:1`"
         else:
-            rr = abs(entry - tp) / abs(sl - entry)
-        rr_str = f"`{rr:.1f}:1`"
+            rr_str = "N/A"
     except Exception:
         rr_str = "N/A"
+
+    entry_str = f"`{signal['entry']}`" if signal.get("entry") else "Market Price"
+    tp_str    = f"`{signal['tp']}`"    if signal.get("tp")    else "N/A"
+    sl_str    = f"`{signal['sl']}`"    if signal.get("sl")    else "N/A"
 
     return (
         f"{test_badge}"
@@ -83,9 +92,9 @@ def format_signal_message(signal: dict) -> str:
         f"━━━━━━━━━━━━━━━━━━\n"
         f"📊 Confidence: `{signal['confidence']}%`\n"
         f"⚡ Leverage: `{signal['leverage']}x` _(Risk: {risk})_\n"
-        f"🎯 Entry: `{signal['entry']}`\n"
-        f"✅ Take Profit: `{signal['tp']}`\n"
-        f"❌ Stop Loss: `{signal['sl']}`\n"
+        f"🎯 Entry: {entry_str}\n"
+        f"✅ Take Profit: {tp_str}\n"
+        f"❌ Stop Loss: {sl_str}\n"
         f"📐 Risk/Reward: {rr_str}\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"📰 *News:* {signal.get('news_title', 'N/A')}\n"
@@ -103,7 +112,6 @@ async def send_signal_to_admin(signal: dict) -> bool:
 
     unique_id = f"{signal.get('coin', 'X')}_{signal.get('direction', 'X')}_{int(time.time())}"
 
-    # Memory + DB dono mein save karo
     pending_signals[unique_id] = signal
     await save_pending_signal(unique_id, signal)
 
@@ -123,7 +131,6 @@ async def send_signal_to_admin(signal: dict) -> bool:
         return True
     except TelegramError as e:
         logger.error(f"Failed to send signal: {e}")
-        # Cleanup agar send fail ho
         pending_signals.pop(unique_id, None)
         await delete_pending_signal(unique_id)
         return False
@@ -136,7 +143,8 @@ async def handle_start_command(update: Update, context: ContextTypes.DEFAULT_TYP
         "🤖 *Trade Bot Active!*\n\n"
         "Commands:\n"
         "📌 `/test` — dummy signal bhejo (real trade nahi hoga)\n"
-        "📊 `/status` — bot ki current status dekho\n\n"
+        "📊 `/status` — bot ki current status dekho\n"
+        "💰 `/balance` — Bulk.trade account balance check karo\n\n"
         f"Current Settings:\n"
         f"• Risk Mode: `{config.RISK_MODE}`\n"
         f"• Min Confidence: `{config.MIN_CONFIDENCE}%`\n"
@@ -156,9 +164,52 @@ async def handle_status_command(update: Update, context: ContextTypes.DEFAULT_TY
         f"• Pending signals: `{count}`\n"
         f"• Risk Mode: `{config.RISK_MODE}`\n"
         f"• Min Confidence: `{config.MIN_CONFIDENCE}%`\n"
-        f"• Trade Size: `${config.TRADE_SIZE_USDT} USDT`",
+        f"• Trade Size: `${config.TRADE_SIZE_USDT} USDT`\n"
+        f"• API URL: `{config.BULK_API_URL}`",
         parse_mode=ParseMode.MARKDOWN,
     )
+
+
+async def handle_balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/balance — Bulk.trade account balance check karo."""
+    if update.effective_user.id != config.TELEGRAM_ADMIN_CHAT_ID:
+        await update.message.reply_text("⛔ Unauthorized")
+        return
+
+    await update.message.reply_text("🔍 Balance check kar raha hoon...")
+
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(
+                f"{config.BULK_API_URL}/account",
+                json={"type": "fullAccount", "user": config.BULK_WALLET_ADDRESS},
+                headers={"Content-Type": "application/json"},
+            )
+        if resp.status_code != 200:
+            await update.message.reply_text(f"❌ API error: {resp.status_code}\n`{resp.text[:200]}`", parse_mode=ParseMode.MARKDOWN)
+            return
+
+        data = resp.json()
+        margin = {}
+        for item in data:
+            if "fullAccount" in item:
+                margin = item["fullAccount"].get("margin", {})
+                break
+
+        if margin:
+            await update.message.reply_text(
+                f"💰 *Account Balance*\n\n"
+                f"• Total: `${margin.get('totalBalance', 0):,.2f}`\n"
+                f"• Available: `${margin.get('availableBalance', 0):,.2f}`\n"
+                f"• Margin Used: `${margin.get('marginUsed', 0):,.2f}`\n"
+                f"• Unrealized PnL: `${margin.get('unrealizedPnl', 0):,.2f}`",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        else:
+            await update.message.reply_text("⚠️ Balance data nahi mila.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Balance check failed: `{e}`", parse_mode=ParseMode.MARKDOWN)
 
 
 async def handle_test_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -183,7 +234,6 @@ async def handle_approval_callback(update: Update, context: ContextTypes.DEFAULT
         await query.edit_message_text("⚠️ Invalid callback data.")
         return
 
-    # Memory se pehle try karo, phir DB se
     signal = pending_signals.get(unique_id) or await get_pending_signal(unique_id)
 
     if not signal:
@@ -240,7 +290,6 @@ async def handle_approval_callback(update: Update, context: ContextTypes.DEFAULT
             parse_mode=ParseMode.MARKDOWN,
         )
 
-    # Cleanup dono jagah se
     pending_signals.pop(unique_id, None)
     await delete_pending_signal(unique_id)
 
