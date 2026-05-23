@@ -5,9 +5,20 @@ import config
 
 logger = logging.getLogger(__name__)
 
+# Bulk.trade minimum order sizes (approximate)
+MIN_SIZE_MAP = {
+    "BTC":  0.001,
+    "ETH":  0.01,
+    "SOL":  0.1,
+    "BNB":  0.01,
+    "XRP":  10.0,
+    "ADA":  10.0,
+    "DOGE": 100.0,
+    "default": 0.01,
+}
+
 
 def _get_signer() -> Signer:
-    """Load keypair from env and return a Signer."""
     private_key_b58 = config.BULK_PRIVATE_KEY
     if not private_key_b58:
         raise ValueError("BULK_PRIVATE_KEY is not set in environment variables.")
@@ -19,21 +30,35 @@ def _coin_to_symbol(coin: str) -> str:
     return f"{coin.upper()}-USD"
 
 
+def _calculate_size(coin: str, entry: float, usdt_amount: float) -> float:
+    """
+    USDT amount se coin size calculate karo.
+    Minimum size check bhi karo.
+    """
+    if entry <= 0:
+        return MIN_SIZE_MAP.get(coin.upper(), MIN_SIZE_MAP["default"])
+
+    size = round(usdt_amount / entry, 6)
+
+    # Minimum size enforce karo
+    min_size = MIN_SIZE_MAP.get(coin.upper(), MIN_SIZE_MAP["default"])
+    if size < min_size:
+        logger.warning(
+            f"Size {size} too small for {coin}, using minimum {min_size}"
+        )
+        size = min_size
+
+    return size
+
+
 async def execute_trade(signal: dict) -> dict:
     """
     Execute a bracket trade on Bulk.trade:
       Step 1 — Leverage set karo (sign_user_settings)
       Step 2 — Entry + SL + TP ek atomic transaction mein (sign_group)
-
-    Library supported order types:
-      - market : {'type': 'order', ..., 'order_type': {'type': 'market'}}
-      - limit  : {'type': 'order', ..., 'order_type': {'type': 'limit', 'tif': 'GTC'}}
-
-    SL aur TP limit orders hain (reduce_only=True) — jab price SL/TP tak aaye
-    toh automatically fill ho jayenge (GTC resting limit orders).
     """
     coin      = signal["coin"]
-    direction = signal["direction"]   # "LONG" or "SHORT"
+    direction = signal["direction"]
     leverage  = int(signal["leverage"])
     entry     = float(signal["entry"])
     tp_price  = float(signal["tp"])
@@ -42,8 +67,9 @@ async def execute_trade(signal: dict) -> dict:
 
     is_buy = direction == "LONG"
 
-    usdt_amount = config.TRADE_SIZE_USDT
-    size = round(usdt_amount / entry, 6) if entry > 0 else 0.01
+    # Size calculate karo — 2500 USDT default
+    size = _calculate_size(coin, entry, config.TRADE_SIZE_USDT)
+    logger.info(f"Trade size: {size} {coin} ({config.TRADE_SIZE_USDT} USDT @ {entry})")
 
     try:
         signer = _get_signer()
@@ -66,16 +92,12 @@ async def execute_trade(signal: dict) -> dict:
             logger.warning(f"Leverage set failed: {resp.status_code} {data}")
     except Exception as e:
         logger.error(f"Leverage set exception: {e}")
-        # Leverage fail hone pe bhi trade try karte hain
 
-    # ── Step 2: Bracket order — Entry + SL + TP atomic ───────
-    # LONG  → entry buy,  SL sell limit neeche, TP sell limit upar
-    # SHORT → entry sell, SL buy limit upar,    TP buy limit neeche
-    sl_is_buy = not is_buy   # LONG mein SL sell hai, SHORT mein buy
-    tp_is_buy = not is_buy   # same direction as SL
+    # ── Step 2: Bracket order — Entry + SL + TP ──────────────
+    sl_is_buy = not is_buy
+    tp_is_buy = not is_buy
 
     orders = [
-        # Entry: market order
         {
             "type": "order",
             "symbol": symbol,
@@ -84,7 +106,6 @@ async def execute_trade(signal: dict) -> dict:
             "size": size,
             "order_type": {"type": "market"},
         },
-        # Stop-Loss: reduce-only limit order
         {
             "type": "order",
             "symbol": symbol,
@@ -94,7 +115,6 @@ async def execute_trade(signal: dict) -> dict:
             "reduce_only": True,
             "order_type": {"type": "limit", "tif": "GTC"},
         },
-        # Take-Profit: reduce-only limit order
         {
             "type": "order",
             "symbol": symbol,
@@ -122,7 +142,6 @@ async def execute_trade(signal: dict) -> dict:
             logger.error(f"Bracket order failed: {msg}")
             return {"success": False, "message": f"Trade failed: {msg}"}
 
-        # Response parse karo
         statuses = data.get("response", {}).get("data", {}).get("statuses", [])
         results = []
         for i, st in enumerate(statuses):
@@ -130,11 +149,13 @@ async def execute_trade(signal: dict) -> dict:
             if "filled" in st or "resting" in st or "working" in st:
                 results.append(f"✅ {label} placed")
             elif "error" in st:
-                results.append(f"⚠️ {label} error: {st['error'].get('message', '?')}")
+                results.append(f"⚠️ {label}: {st['error'].get('message', '?')}")
+            elif "rejectedRiskLimit" in st:
+                results.append(f"❌ {label}: Risk limit exceeded")
             else:
                 results.append(f"✅ {label}: {list(st.keys())[0]}")
 
-        logger.info(f"Trade executed: {symbol} {direction} x{leverage} | {' | '.join(results)}")
+        logger.info(f"Trade executed: {symbol} {direction} x{leverage} | size={size} | {' | '.join(results)}")
         return {"success": True, "message": "\n".join(results)}
 
     except Exception as e:
