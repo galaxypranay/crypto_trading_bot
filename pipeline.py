@@ -10,7 +10,7 @@ import config
 
 logger = logging.getLogger(__name__)
 
-# Global lock — ek waqt mein sirf ek pipeline run karega
+# Global lock — ek waqt mein sirf ek piopeline run karega
 _pipeline_lock = asyncio.Lock()
 
 
