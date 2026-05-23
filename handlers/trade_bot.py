@@ -257,7 +257,7 @@ async def handle_approval_callback(update: Update, context: ContextTypes.DEFAULT
         await query.edit_message_text(
             text=(
                 f"{format_signal_message(signal)}\n\n"
-                f"💰 *Kitne USDT ka trade karna hai?*\n"
+                f"💰 *Kitne USD ka trade karna hai?*\n"
                 f"_Preset choose karo ya custom amount type karo._\n"
                 f"⏳ _5 minute mein select nahi kiya toh cancel ho jayega._"
             ),
@@ -303,7 +303,7 @@ async def handle_approval_callback(update: Update, context: ContextTypes.DEFAULT
         await query.edit_message_text(
             text=(
                 f"{format_signal_message(signal)}\n\n"
-                f"✏️ *Custom amount type karo (USDT):*\n"
+                f"✏️ *Custom amount type karo (USD):*\n"
                 f"_Example: 150 ya 750_\n"
                 f"⏳ _5 minute mein nahi bheja toh cancel ho jayega._"
             ),
@@ -328,7 +328,7 @@ async def handle_approval_callback(update: Update, context: ContextTypes.DEFAULT
         await query.edit_message_text(
             text=(
                 f"{format_signal_message(signal)}\n\n"
-                f"💰 *Kitne USDT ka trade karna hai?*\n"
+                f"💰 *Kitne USD ka trade karna hai?*\n"
                 f"_Preset choose karo ya custom amount type karo._\n"
                 f"⏳ _5 minute mein select nahi kiya toh cancel ho jayega._"
             ),
@@ -396,7 +396,7 @@ async def handle_custom_amount_message(update: Update, context: ContextTypes.DEF
 
 # ── Core: execute trade with chosen amount ────────────────────
 
-async def _execute_with_amount(query, unique_id: str, amount_usdt: float):
+async def _execute_with_amount(query, unique_id: str, amount_usd: float):
     """Amount confirm ho gayi — trade execute karo."""
     entry = awaiting_amount.pop(unique_id, None)
     signal = (entry["signal"] if entry else None) or \
@@ -414,7 +414,7 @@ async def _execute_with_amount(query, unique_id: str, amount_usdt: float):
     await delete_pending_signal(unique_id)
 
     # Signal mein trade size inject karo
-    signal["trade_size_usdt"] = amount_usdt
+    signal["trade_size_usd"] = amount_usd
 
     try:
         await query.edit_message_text(
@@ -422,7 +422,7 @@ async def _execute_with_amount(query, unique_id: str, amount_usdt: float):
                 f"⏳ *Executing trade...*\n\n"
                 f"{signal['coin']} {signal['direction']} @ `{signal['entry']}`\n"
                 f"Leverage: `{signal['leverage']}x`\n"
-                f"💰 Size: `${amount_usdt} USDT`"
+                f"💰 Size: `${amount_usd} USD`"
             ),
             parse_mode=ParseMode.MARKDOWN,
         )
@@ -440,7 +440,7 @@ async def _execute_with_amount(query, unique_id: str, amount_usdt: float):
                     f"✅ *Trade Executed!*\n\n"
                     f"*{signal['coin']} {signal['direction']}* @ `{signal['entry']}`\n"
                     f"Leverage: `{signal['leverage']}x` | Confidence: `{signal['confidence']}%`\n"
-                    f"💰 Size: `${amount_usdt} USDT`\n\n"
+                    f"💰 Size: `${amount_usd} USD`\n\n"
                     f"🎯 TP: `{signal['tp']}`\n"
                     f"🛑 SL: `{signal['sl']}`\n\n"
                     f"_{result['message']}_"
