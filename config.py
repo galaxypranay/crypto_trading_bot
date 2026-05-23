@@ -27,10 +27,10 @@ BULK_API_URL        = os.getenv("BULK_API_URL", "https://staging-api.bulk.trade/
 BULK_WALLET_ADDRESS = os.getenv("BULK_WALLET_ADDRESS")
 BULK_PRIVATE_KEY    = os.getenv("BULK_PRIVATE_KEY")
 
-# TRADE_SIZE_USDT — default fallback agar admin amount choose na kare
+# TRADE_SIZE_USD — default fallback agar admin amount choose na kare
 # Bot mein ab admin khud approve ke waqt amount choose karta hai
 # Yeh variable optional hai, sirf fallback ke liye rakha hai
-TRADE_SIZE_USDT = float(os.getenv("TRADE_SIZE_USDT", "100"))
+TRADE_SIZE_USD = float(os.getenv("TRADE_SIZE_USD", os.getenv("TRADE_SIZE_USDT", "100")))
 
 # ── Risk Settings ─────────────────────────────────────────────
 RISK_MODE      = os.getenv("RISK_MODE", "HIGH")
