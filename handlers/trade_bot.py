@@ -6,9 +6,6 @@ from telegram.error import TelegramError
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 import config
 from services.trade_executor import execute_trade
-from services.news_fetcher import fetch_coingecko_news
-from services.ai_analyzer import generate_description, analyze_news, pick_best_signal
-from handlers.news_bot import post_news_to_channel
 
 logger = logging.getLogger(__name__)
 
@@ -43,9 +40,8 @@ def get_trade_app() -> Application:
             .build()
         )
         _trade_app.add_handler(CallbackQueryHandler(handle_approval_callback))
-        _trade_app.add_handler(CommandHandler("test",     handle_test_command))
-        _trade_app.add_handler(CommandHandler("start",    handle_start_command))
-        _trade_app.add_handler(CommandHandler("postnews", handle_postnews_command))
+        _trade_app.add_handler(CommandHandler("test",  handle_test_command))
+        _trade_app.add_handler(CommandHandler("start", handle_start_command))
     return _trade_app
 
 
@@ -103,10 +99,10 @@ async def handle_start_command(update: Update, context: ContextTypes.DEFAULT_TYP
     if update.effective_user.id != config.TELEGRAM_ADMIN_CHAT_ID:
         return
     await update.message.reply_text(
-        "🤖 *Crypto Trade Bot active!*\n\n"
+        "🤖 *Trade Bot active!*\n\n"
         "Commands:\n"
-        "📌 `/test` — dummy signal bhejo (koi real trade nahi)\n"
-        "📰 `/postnews` — latest coin news fetch karo, channel mein post karo, signal bhejo\n",
+        "📌 `/test` — dummy signal bhejo (koi real trade nahi)\n\n"
+        "Jab AI koi accha trade dhundega, yahan Approve/Reject milega.",
         parse_mode=ParseMode.MARKDOWN,
     )
 
@@ -117,69 +113,6 @@ async def handle_test_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     await update.message.reply_text("🧪 Test signal bhej raha hoon...")
     await send_signal_to_admin(TEST_SIGNAL.copy())
-
-
-async def handle_postnews_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/postnews — latest coin news fetch, channel post, trade signal admin ko bhejo."""
-    if update.effective_user.id != config.TELEGRAM_ADMIN_CHAT_ID:
-        await update.message.reply_text("⛔ Unauthorized")
-        return
-
-    await update.message.reply_text("🔍 CoinGecko se latest news fetch kar raha hoon...")
-
-    # Step 1: Fetch news
-    try:
-        articles = await fetch_coingecko_news()
-    except Exception as e:
-        await update.message.reply_text(f"❌ News fetch failed: {e}")
-        return
-
-    if not articles:
-        await update.message.reply_text("⚠️ Koi coin-related news nahi mili.")
-        return
-
-    # Sirf pehla (latest) article use karo
-    article = articles[0]
-    await update.message.reply_text(
-        f"📰 News mili:\n*{article['title']}*\n\nChannel pe post kar raha hoon...",
-        parse_mode=ParseMode.MARKDOWN,
-    )
-
-    # Step 2: AI description generate karo
-    try:
-        description = await generate_description(article)
-    except Exception as e:
-        logger.error(f"Description error: {e}")
-        description = article.get("description", article["title"])
-
-    # Step 3: Channel mein post karo
-    posted = await post_news_to_channel(article, description)
-    if not posted:
-        await update.message.reply_text("⚠️ Channel post failed — check NEWS_BOT_TOKEN.")
-
-    # Step 4: Trade signal analyze karo
-    await update.message.reply_text("🤖 AI trade signal analyze kar raha hoon...")
-    try:
-        signal = await analyze_news(article)
-    except Exception as e:
-        await update.message.reply_text(f"❌ AI analysis failed: {e}")
-        return
-
-    if not signal or not signal.get("tradeable"):
-        reason = signal.get("reason", "unclear") if signal else "no response"
-        await update.message.reply_text(
-            f"📭 Is news se koi trade signal nahi bana.\n_Reason: {reason}_",
-            parse_mode=ParseMode.MARKDOWN,
-        )
-        return
-
-    # Step 5: Signal admin ko bhejo
-    await update.message.reply_text(
-        f"✅ Signal ready! *{signal['coin']} {signal['direction']}* "
-        f"@ {signal['confidence']}% confidence\n\nApprove/Reject card bhej raha hoon...",
-        parse_mode=ParseMode.MARKDOWN,
-    )
-    await send_signal_to_admin(signal)
 
 
 async def handle_approval_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
